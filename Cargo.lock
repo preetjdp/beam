@@ -234,7 +234,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "beam-agent"
-version = "0.3.26"
+version = "0.3.26+wan.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "beam-protocol"
-version = "0.3.26"
+version = "0.3.26+wan.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "beam-server"
-version = "0.3.26"
+version = "0.3.26+wan.1"
 dependencies = [
  "anyhow",
  "axum",
