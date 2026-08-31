@@ -8,6 +8,8 @@ on:
         required: true
         default: 0.3.26+wan.1
   push:
+    branches:
+      - codex/wan-tuned-package
     tags:
       - "v*+wan.*"
 
@@ -20,7 +22,7 @@ concurrency:
 
 jobs:
   release:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/codex/wan-tuned-package'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -63,7 +65,7 @@ jobs:
             "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git checkout -B codex/wan-tuned-package
           git push --set-upstream origin codex/wan-tuned-package
-          make release VERSION='${{ inputs.version }}'
+          make release VERSION='${{ inputs.version || '0.3.26+wan.1' }}'
 
   build-test-publish:
     if: startsWith(github.ref, 'refs/tags/')
