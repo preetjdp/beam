@@ -65,7 +65,8 @@ jobs:
             "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git checkout -B codex/wan-tuned-package
           git push --set-upstream origin codex/wan-tuned-package
-          make release VERSION='${{ inputs.version || '0.3.26+wan.1' }}'
+          GITHUB_REPOSITORY=frecar/beam \
+            make release VERSION='${{ inputs.version || '0.3.26+wan.1' }}'
 
   build-test-publish:
     if: startsWith(github.ref, 'refs/tags/')
@@ -106,7 +107,7 @@ jobs:
       - name: Verify version and run full CI
         run: |
           make version-check
-          make ci
+          GITHUB_REPOSITORY=frecar/beam make ci
 
       - name: Build release package
         run: |
