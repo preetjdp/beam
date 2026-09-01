@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
-use beam_protocol::{AgentCommand, FRAME_MAGIC, InputEvent, SignalingMessage};
+use beam_protocol::{AgentCommand, FRAME_MAGIC, InputEvent, SignalingMessage, VideoFrameHeader};
 use bytes::Bytes;
 use tokio::sync::{Notify, RwLock, broadcast};
 use tokio::time::{Duration, Instant, interval};
@@ -72,6 +72,10 @@ pub(crate) fn frame_magic_is_valid(data: &[u8]) -> bool {
     frame_magic(data).is_some_and(|m| m == FRAME_MAGIC)
 }
 
+pub(crate) fn media_frame_is_valid(data: &[u8]) -> bool {
+    frame_magic_is_valid(data) && VideoFrameHeader::validate_complete(data).is_ok()
+}
+
 /// Outcome of parsing a browser→server text frame.
 #[derive(Debug)]
 pub(crate) enum BrowserMessageOutcome {
@@ -80,6 +84,8 @@ pub(crate) enum BrowserMessageOutcome {
     /// A ClientMetrics report — update the client metrics store (only if
     /// metrics are enabled).
     Metrics(beam_protocol::ClientMetricsReport),
+    /// Four-timestamp clock synchronization request.
+    ClockSync { id: u32, t0_us: u64 },
     /// A regular input event — wrap as AgentCommand and forward to the agent.
     Forward(AgentCommand),
     /// Malformed JSON or unknown shape — reply with an error frame whose body
@@ -121,6 +127,7 @@ pub(crate) fn parse_browser_text(text: &str) -> BrowserMessageOutcome {
             BrowserMessageOutcome::Pong { id, sent_ms }
         }
         Ok(InputEvent::ClientMetrics(report)) => BrowserMessageOutcome::Metrics(report),
+        Ok(InputEvent::ClockSync { id, t0_us }) => BrowserMessageOutcome::ClockSync { id, t0_us },
         Ok(event) => BrowserMessageOutcome::Forward(AgentCommand::Input(event)),
         Err(e) => BrowserMessageOutcome::InvalidJson(e.to_string()),
     }
@@ -182,6 +189,14 @@ pub async fn remove_channel(registry: &ChannelRegistry, session_id: Uuid) {
 ///
 /// Only one browser per session at a time. Connecting a new browser
 /// kicks the previous one with close code 4001 ("replaced").
+fn monotonic_us() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
+}
+
 pub async fn handle_browser_ws(
     mut socket: WebSocket,
     session_id: Uuid,
@@ -286,7 +301,10 @@ pub async fn handle_browser_ws(
                         tracing::warn!(%session_id, skipped = n, "Browser video consumer lagged — requesting keyframe");
                         // Dropped frames likely included the IDR keyframe.
                         // Request a new one so the browser decoder can recover.
-                        let _ = channel.to_agent.send(AgentCommand::Input(InputEvent::VisibilityState { visible: true }));
+                        let _ = channel.to_agent.send(AgentCommand::Input(InputEvent::RequestKeyframe {
+                            generation: 0,
+                            reason: "server_relay_lag".to_string(),
+                        }));
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -308,6 +326,18 @@ pub async fn handle_browser_ws(
                             BrowserMessageOutcome::Metrics(report) => {
                                 if client_metrics_enabled {
                                     client_metrics.update(session_id, report);
+                                }
+                            }
+                            BrowserMessageOutcome::ClockSync { id, t0_us } => {
+                                let t1_us = monotonic_us();
+                                let msg = SignalingMessage::ClockSyncReply {
+                                    id,
+                                    t0_us,
+                                    t1_us,
+                                    t2_us: monotonic_us(),
+                                };
+                                if let Ok(json) = serde_json::to_string(&msg) {
+                                    let _ = socket.send(Message::Text(json.into())).await;
                                 }
                             }
                             BrowserMessageOutcome::Forward(cmd) => {
@@ -362,6 +392,7 @@ pub async fn handle_agent_ws(mut socket: WebSocket, session_id: Uuid, registry: 
     let mut last_pong = Instant::now();
 
     tracing::info!(%session_id, "Agent WebSocket connected");
+    let mut latest_generation = 0u32;
 
     loop {
         tokio::select! {
@@ -416,7 +447,15 @@ pub async fn handle_agent_ws(mut socket: WebSocket, session_id: Uuid, registry: 
                     Ok(Message::Binary(data)) => {
                         // Binary frames: validate magic header, relay to browser
                         let len = data.len();
-                        if frame_magic_is_valid(&data) {
+                        if media_frame_is_valid(&data) {
+                            let header = VideoFrameHeader::deserialize(&data).expect("validated frame header");
+                            if let Some(extension) = header.extension {
+                                if extension.stream_generation < latest_generation {
+                                    tracing::debug!(%session_id, generation = extension.stream_generation, latest_generation, "Dropping stale stream generation");
+                                    continue;
+                                }
+                                latest_generation = latest_generation.max(extension.stream_generation);
+                            }
                             let receivers = channel.video_frames.receiver_count();
                             match channel.video_frames.send(Bytes::from(data.to_vec())) {
                                 Ok(n) => {
@@ -714,6 +753,18 @@ mod tests {
         let mut frame = vec![0x01, 0x02, 0x03, 0x04];
         frame.extend([0xAA, 0xBB, 0xCC]);
         assert_eq!(frame_magic(&frame), Some(0x04030201));
+    }
+
+    #[test]
+    fn media_frame_validation_rejects_magic_only_and_truncated_payload() {
+        assert!(!media_frame_is_valid(&FRAME_MAGIC.to_le_bytes()));
+        let header = beam_protocol::VideoFrameHeader::video(640, 480, 1, 10, false);
+        assert!(!media_frame_is_valid(
+            &header.serialize_with_payload(&[1, 2])
+        ));
+        assert!(media_frame_is_valid(
+            &header.serialize_with_payload(&[0; 10])
+        ));
     }
 
     #[test]

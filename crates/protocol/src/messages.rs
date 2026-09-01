@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::{ClientCapabilities, StreamDescriptor};
+
 /// Signaling messages between browser, server, and agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -9,6 +11,16 @@ pub enum SignalingMessage {
     SessionReady { session_id: Uuid },
     /// Response to a browser metrics ping. Used for client-observed RTT.
     MetricsPong { id: u32, sent_ms: f64 },
+    /// Four-timestamp clock synchronization reply. Browser supplies t0 and
+    /// records t3 when this arrives; t1/t2 use the server monotonic clock.
+    ClockSyncReply {
+        id: u32,
+        t0_us: u64,
+        t1_us: u64,
+        t2_us: u64,
+    },
+    /// Effective settings update. Never describes merely requested settings.
+    StreamDescriptor { descriptor: StreamDescriptor },
     /// Error
     Error { message: String },
 }
@@ -41,6 +53,24 @@ pub struct ClientMetricsReport {
     pub audio_dropouts_total: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_buffer_delay_ms: Option<f64>,
+    #[serde(default)]
+    pub video_frames_received_total: u64,
+    #[serde(default)]
+    pub video_frames_presented_total: u64,
+    #[serde(default)]
+    pub sequence_gaps_total: u64,
+    #[serde(default)]
+    pub recovery_requests_total: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_queue_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_frame_age_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_submit_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_event_loop_lag_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_generation: Option<u32>,
 }
 
 /// Input events sent over WebSocket (compact format).
@@ -78,9 +108,24 @@ pub enum InputEvent {
     /// Clipboard text for X11 PRIMARY selection (middle-click paste)
     #[serde(rename = "cp")]
     ClipboardPrimary { text: String },
-    /// Resolution change request
+    /// Legacy resolution change request in CSS pixels (DPR 1).
     #[serde(rename = "r")]
     Resize { w: u32, h: u32 },
+    /// Physical-pixel sizing intent. The server/agent clamps this and replies
+    /// with an effective stream descriptor for `request_generation`.
+    #[serde(rename = "ri")]
+    ResizeIntent {
+        css_w: u32,
+        css_h: u32,
+        dpr: f64,
+        request_generation: u32,
+    },
+    /// Explicit dependency-chain recovery request.
+    #[serde(rename = "rk")]
+    RequestKeyframe { generation: u32, reason: String },
+    /// NTP-style browser/server clock probe.
+    #[serde(rename = "cs")]
+    ClockSync { id: u32, t0_us: u64 },
     /// Keyboard layout hint (XKB layout name, e.g. "no", "us", "de")
     #[serde(rename = "l")]
     Layout { layout: String },
@@ -120,6 +165,17 @@ pub struct AuthRequest {
     pub viewport_width: Option<u32>,
     /// Browser viewport height in CSS pixels.
     pub viewport_height: Option<u32>,
+    /// Physical display intent. Absent fields preserve DPR-1 old-client behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_pixel_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_viewport_scale: Option<f64>,
+    #[serde(default)]
+    pub capabilities: ClientCapabilities,
     /// Per-session idle timeout override in seconds. None = use global default.
     /// Must be in range 60..=86400 (1 minute to 24 hours).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,6 +208,9 @@ pub struct AuthResponse {
     /// Whether the server wants this client to emit anonymous quality metrics.
     #[serde(default)]
     pub client_metrics_enabled: bool,
+    /// Effective initial stream settings. Older servers/clients omit/ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_descriptor: Option<StreamDescriptor>,
 }
 
 /// Session information
@@ -307,6 +366,7 @@ mod tests {
             audio_frames_decoded_total: 90,
             audio_dropouts_total: 1,
             audio_buffer_delay_ms: Some(35.0),
+            ..ClientMetricsReport::default()
         });
         let json = serde_json::to_string(&metrics).unwrap();
         assert!(json.contains(r#""t":"cm""#));
@@ -456,6 +516,11 @@ mod tests {
             password: "super_secret".to_string(),
             viewport_width: None,
             viewport_height: None,
+            device_pixel_ratio: None,
+            screen_width: None,
+            screen_height: None,
+            visual_viewport_scale: None,
+            capabilities: ClientCapabilities::default(),
             idle_timeout: None,
         };
         let debug_str = format!("{:?}", req);
@@ -486,6 +551,11 @@ mod tests {
             password: "pass".to_string(),
             viewport_width: None,
             viewport_height: None,
+            device_pixel_ratio: None,
+            screen_width: None,
+            screen_height: None,
+            visual_viewport_scale: None,
+            capabilities: ClientCapabilities::default(),
             idle_timeout: None,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -500,6 +570,7 @@ mod tests {
             release_token: None,
             idle_timeout: Some(3600),
             client_metrics_enabled: true,
+            stream_descriptor: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains(r#""idle_timeout":3600"#));
@@ -514,6 +585,7 @@ mod tests {
             release_token: None,
             idle_timeout: None,
             client_metrics_enabled: false,
+            stream_descriptor: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("idle_timeout"));
@@ -575,6 +647,7 @@ mod tests {
                 audio_frames_decoded_total: 8,
                 audio_dropouts_total: 0,
                 audio_buffer_delay_ms: Some(25.0),
+                ..ClientMetricsReport::default()
             }),
         ];
 

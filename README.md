@@ -87,11 +87,22 @@ port = 8444
 # sentry_environment = "production"
 
 [video]
-bitrate = 5000      # kbps (initial target)
-framerate = 120
-# encoder = "nvh264enc"  # auto-detected: nvh264enc > vah264enc > x264enc
-# max_width = 3840       # clamp resolution (default: 3840, 0 = unlimited)
-# max_height = 2160      # clamp resolution (default: 2160, 0 = unlimited)
+# Measured software/WAN starting profile; hardware/LAN deployments may use the
+# 50 Mbps / 120 fps repository defaults after benchmarking their path.
+bitrate = 15000     # kbps
+min_bitrate = 4000
+max_bitrate = 20000
+framerate = 60
+# encoder = "x264enc"    # auto: nvcudah264enc > nvh264enc > vah264enc > x264enc
+# max_width = 3840
+# max_height = 2160
+# max_pixels = 8294400   # encoded physical-pixel budget
+# max_dpr = 2.0
+# hidpi_enabled = false  # first deploy in observe-only DPR mode
+# h264_profile = "main" # auto|main|high; enhanced profiles are negotiated
+# x264_preset = "veryfast"
+# frame_header_version = 1 # v2 adds generation/sequence/dependency metadata
+# treatment_id = "baseline"
 
 [audio]
 enabled = true
@@ -101,6 +112,12 @@ bitrate = 128       # kbps (Opus)
 max_sessions = 8
 # idle_timeout = 3600  # seconds (0 = disabled, default: 3600)
 ```
+
+### Streaming experiments
+
+Each login emits a versioned effective stream manifest and the session/F9 diagnostics show the negotiated codec/profile, encoder, control/media transport, resolution, DPR, FPS/bitrate targets, and treatment ID. Requested enhancements that are not active remain on the H.264 Main/WSS compatibility path with a reason.
+
+Use `scripts/stream-benchmark.sh` for opt-in, cleanup-safe process/network collection and `scripts/stream-report.py` for median/tail/effect-size reports. The benchmark runner refuses OS `/tmp`, requires `BEAM_BENCH_ALLOW_NETEM=1` before changing a qdisc, and restores shaping on every exit path.
 
 ### TLS Certificate
 
@@ -143,7 +160,7 @@ sudo systemctl restart beam
 
 ### Network
 
-Beam needs only **port 8444/tcp** open (HTTPS + WebSocket). All video, audio, and input traffic flows over a single TLS WebSocket connection — no additional ports or UDP required.
+The compatibility deployment needs only **port 8444/tcp** (HTTPS + WSS). H.264 Main over WSS remains available to every client. Experimental WebTransport profiles additionally require UDP on the same numeric HTTPS port; do not advertise HTTP/3 until that listener is configured and healthy.
 
 - Beam binds to `0.0.0.0` by default — restrict with `bind = "10.0.0.1"` in `beam.toml` if needed
 

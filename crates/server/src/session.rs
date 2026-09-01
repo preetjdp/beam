@@ -695,6 +695,25 @@ impl SessionManager {
         cmd.args(["--bitrate", &self.video_config.bitrate.to_string()]);
         cmd.args(["--max-width", &self.video_config.max_width.to_string()]);
         cmd.args(["--max-height", &self.video_config.max_height.to_string()]);
+        cmd.args(["--max-pixels", &self.video_config.max_pixels.to_string()]);
+        cmd.args(["--max-dpr", &self.video_config.max_dpr.to_string()]);
+        cmd.args([
+            "--frame-header-version",
+            &self.video_config.frame_header_version.to_string(),
+        ]);
+        cmd.args([
+            "--h264-profile",
+            match self.video_config.h264_profile {
+                beam_protocol::CodecProfile::Auto => "auto",
+                beam_protocol::CodecProfile::Main => "main",
+                beam_protocol::CodecProfile::High => "high",
+            },
+        ]);
+        cmd.args(["--x264-preset", &self.video_config.x264_preset]);
+        cmd.args(["--treatment-id", &self.video_config.treatment_id]);
+        if self.video_config.hidpi_enabled {
+            cmd.arg("--hidpi");
+        }
 
         if let Some(ref encoder) = self.video_config.encoder {
             cmd.args(["--encoder", encoder]);

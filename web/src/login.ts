@@ -2,6 +2,7 @@
  * Login form handling, rate limit countdown, error display, and focus management.
  */
 
+import { collectClientCapabilities } from './capabilities';
 import type { LoginResponse } from './session';
 import { saveSession } from './session';
 import { SESSION_TIMEOUT_KEY } from './settings';
@@ -88,6 +89,16 @@ export async function performLogin(
 
   const MAX_RETRIES = 3;
   const BASE_DELAY = 1000;
+  const viewportWidth = Math.floor(window.innerWidth / 2) * 2;
+  const viewportHeight = Math.floor((window.innerHeight - 28) / 2) * 2;
+  const devicePixelRatio = Number.isFinite(window.devicePixelRatio)
+    ? Math.max(0.5, Math.min(4, window.devicePixelRatio))
+    : 1;
+  const capabilities = await collectClientCapabilities(
+    viewportWidth,
+    viewportHeight,
+    devicePixelRatio
+  );
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -99,11 +110,15 @@ export async function performLogin(
             {
               username,
               password,
-              // Subtract the 28px status bar from viewport height so the remote
-              // desktop resolution matches the actual video area.
-              // Round down to even numbers (H.264 encoders require even dimensions).
-              viewport_width: Math.floor(window.innerWidth / 2) * 2,
-              viewport_height: Math.floor((window.innerHeight - 28) / 2) * 2,
+              // CSS-pixel geometry stays distinct from physical-pixel intent.
+              // The server is authoritative for DPR, dimensions and pixel caps.
+              viewport_width: viewportWidth,
+              viewport_height: viewportHeight,
+              device_pixel_ratio: devicePixelRatio,
+              screen_width: Math.max(0, Math.floor(window.screen.width)),
+              screen_height: Math.max(0, Math.floor(window.screen.height)),
+              visual_viewport_scale: window.visualViewport?.scale ?? 1,
+              capabilities,
             },
             sessionTimeoutSelect.value
               ? { idle_timeout: parseInt(sessionTimeoutSelect.value, 10) }

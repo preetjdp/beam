@@ -29,12 +29,33 @@ pub struct Encoder {
 }
 
 impl Encoder {
+    #[cfg(test)]
     pub fn with_encoder_preference(
         width: u32,
         height: u32,
         framerate: u32,
         bitrate: u32,
         preferred_encoder: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        Self::with_quality_options(
+            width,
+            height,
+            framerate,
+            bitrate,
+            preferred_encoder,
+            "main",
+            "veryfast",
+        )
+    }
+
+    pub fn with_quality_options(
+        width: u32,
+        height: u32,
+        framerate: u32,
+        bitrate: u32,
+        preferred_encoder: Option<&str>,
+        h264_profile: &str,
+        x264_preset: &str,
     ) -> anyhow::Result<Self> {
         let (encoder_type, encoder_name) = detect_encoder(preferred_encoder)?;
         info!(
@@ -86,12 +107,24 @@ impl Encoder {
         appsrc.set_property("max-latency", 0i64);
 
         // encoder element
-        let encoder = build_encoder_element(encoder_type, &encoder_name, bitrate, framerate)?;
+        let encoder = build_encoder_element_with_preset(
+            encoder_type,
+            &encoder_name,
+            bitrate,
+            framerate,
+            x264_preset,
+        )?;
 
-        // capsfilter: force main profile for best quality/compression ratio.
+        // Profile remains explicit and is selected only after browser capability
+        // negotiation. `auto` conservatively resolves to Main.
         // WebCodecs VideoDecoder handles all H.264 profiles natively.
+        let effective_profile = if h264_profile == "high" {
+            "high"
+        } else {
+            "main"
+        };
         let profile_caps = gst::Caps::builder("video/x-h264")
-            .field("profile", "main")
+            .field("profile", effective_profile)
             .build();
         let capsfilter = ElementFactory::make("capsfilter")
             .property("caps", &profile_caps)
@@ -442,11 +475,22 @@ fn detect_encoder(preferred: Option<&str>) -> anyhow::Result<(EncoderType, Strin
     bail!("No H.264 encoder found. Install gstreamer plugins (good/bad/ugly).")
 }
 
+#[cfg(test)]
 fn build_encoder_element(
     encoder_type: EncoderType,
     name: &str,
     bitrate: u32,
     framerate: u32,
+) -> anyhow::Result<gst::Element> {
+    build_encoder_element_with_preset(encoder_type, name, bitrate, framerate, "veryfast")
+}
+
+fn build_encoder_element_with_preset(
+    encoder_type: EncoderType,
+    name: &str,
+    bitrate: u32,
+    framerate: u32,
+    x264_preset: &str,
 ) -> anyhow::Result<gst::Element> {
     let elem = match encoder_type {
         EncoderType::Nvidia => ElementFactory::make(name)
@@ -485,7 +529,7 @@ fn build_encoder_element(
         // producing materially cleaner output per bit than ultrafast.
         EncoderType::Software => ElementFactory::make(name)
             .property_from_str("tune", "zerolatency")
-            .property_from_str("speed-preset", "veryfast")
+            .property_from_str("speed-preset", x264_preset)
             .property("bitrate", bitrate)
             .property("key-int-max", 30u32)
             .property("bframes", 0u32)

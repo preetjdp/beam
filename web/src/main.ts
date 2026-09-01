@@ -27,7 +27,13 @@ import {
 import { InputHandler, type TouchMode } from './input';
 import { clearRateLimitTimer, performLogin } from './login';
 import { initMonitoring } from './monitoring';
-import { clearSession, loadSession, sendReleaseBeacon, TokenManager } from './session';
+import {
+  clearSession,
+  loadSession,
+  sendReleaseBeacon,
+  type StreamDescriptor,
+  TokenManager,
+} from './session';
 import {
   AUDIO_MUTED_KEY,
   dismissIdleWarning,
@@ -153,6 +159,7 @@ let isReturningToLogin = false;
 
 // Performance overlay state (updated from renderer)
 let perfFps = 0;
+let effectiveStreamDescriptor: StreamDescriptor | null = null;
 
 // Idle timeout warning state
 let lastActivity = Date.now();
@@ -539,14 +546,25 @@ function updateSessionInfoPanel(): void {
   if (renderer) {
     const w = renderer.getVideoWidth();
     const h = renderer.getVideoHeight();
-    if (w > 0 && h > 0) {
-      setText('sip-resolution', `${w}x${h}`);
-    }
+    if (w > 0 && h > 0) setText('sip-resolution', `${w}x${h}`);
     setText('sip-framerate', `${renderer.getFps()} fps`);
-    setText('sip-video-codec', 'H.264');
   }
-
-  setText('sip-transport', 'WSS');
+  if (effectiveStreamDescriptor) {
+    const d = effectiveStreamDescriptor;
+    setText(
+      'sip-resolution',
+      `${d.sizing.encoded_width}x${d.sizing.encoded_height} (${d.sizing.effective_dpr_x.toFixed(2)}x DPR)`
+    );
+    setText('sip-framerate', `${d.fps_target} fps target`);
+    setText('sip-video-codec', `${d.codec.toUpperCase()} ${d.profile}`);
+    setText(
+      'sip-transport',
+      `Control: ${d.control_transport.toUpperCase()} / Media: ${d.media_transport}`
+    );
+  } else {
+    setText('sip-video-codec', 'H.264 Main');
+    setText('sip-transport', 'Control/Media: WSS');
+  }
 
   // Audio muted state
   const sipAudioMuted = document.getElementById('sip-audio-muted');
@@ -595,7 +613,7 @@ function copyStatsToClipboard(): void {
     `Duration: ${duration}`,
     '',
     'Connection:',
-    `  Transport: WebSocket`,
+    `  Transport: ${getText('sip-transport')}`,
     '',
     'Video:',
     `  Resolution: ${resolution}`,
@@ -733,6 +751,7 @@ function handleDisconnect(): void {
   currentSessionId = null;
   connectedSinceTime = null;
   sessionUsername = null;
+  effectiveStreamDescriptor = null;
   hideSessionInfoPanel();
   hideClipboardHistoryPanel();
   hideAdminPanel();
@@ -904,7 +923,12 @@ async function handleLogin(event: SubmitEvent): Promise<void> {
   tokenManager.scheduleTokenRefresh();
 
   try {
-    await startConnection(data.session_id, data.token, data.client_metrics_enabled === true);
+    await startConnection(
+      data.session_id,
+      data.token,
+      data.client_metrics_enabled === true,
+      data.stream_descriptor
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Connection failed.';
     showLoadingError(message);
@@ -915,7 +939,8 @@ async function handleLogin(event: SubmitEvent): Promise<void> {
 async function startConnection(
   sessionId: string,
   token: string,
-  clientMetricsEnabled = false
+  clientMetricsEnabled = false,
+  initialDescriptor?: StreamDescriptor
 ): Promise<void> {
   if (connection) {
     connection.disconnect();
@@ -941,6 +966,15 @@ async function startConnection(
   connection = new BeamConnection(sessionId, token);
   tokenManager.setConnection(connection);
   renderer = new WebCodecsRenderer(remoteCanvas, desktopView);
+  connection.setInitialStreamDescriptor(initialDescriptor ?? loadSession()?.stream_descriptor);
+  connection.onStreamDescriptor((descriptor) => {
+    effectiveStreamDescriptor = descriptor;
+    renderer?.setStreamGeneration(descriptor.stream_generation);
+    if (sessionInfoVisible) updateSessionInfoPanel();
+  });
+  renderer.onRecoveryNeeded((generation, reason) => {
+    connection?.sendInput({ t: 'rk', generation, reason });
+  });
   if (clientMetricsEnabled) {
     connection.startClientMetrics(() => renderer?.getQualitySnapshot() ?? null);
   }
@@ -967,7 +1001,26 @@ async function startConnection(
   renderer.onFpsUpdate((fps, decodeMs) => {
     updateLatencyStatsFps(fps, decodeMs);
     perfFps = fps;
-    updatePerfOverlay(decodeMs, perfFps, 0, 0);
+    const d = effectiveStreamDescriptor;
+    updatePerfOverlay(
+      decodeMs,
+      perfFps,
+      0,
+      0,
+      d
+        ? {
+            resolution: `${d.sizing.encoded_width}x${d.sizing.encoded_height}`,
+            codec: `${d.codec.toUpperCase()} ${d.profile}`,
+            encoder: d.encoder,
+            media: d.media_transport,
+            control: d.control_transport,
+            dpr: `${d.sizing.effective_dpr_x.toFixed(2)}x`,
+            fpsTarget: d.fps_target,
+            bitrateTarget: d.bitrate_kbps,
+            treatment: d.treatment_id,
+          }
+        : undefined
+    );
   });
 
   // Wire video frames from connection to renderer

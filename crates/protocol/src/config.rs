@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::{CaptureMode, CodecProfile, CongestionMode, MediaTransport};
+
 /// Top-level configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeamConfig {
@@ -87,6 +89,50 @@ pub struct VideoConfig {
     /// Maximum height (0 = unlimited, default: 2160)
     #[serde(default = "default_max_height")]
     pub max_height: u32,
+    /// Maximum encoded pixel count after DPR scaling (0 = unlimited).
+    #[serde(default = "default_max_pixels")]
+    pub max_pixels: u64,
+    /// Maximum negotiated device-pixel ratio.
+    #[serde(default = "default_max_dpr")]
+    pub max_dpr: f64,
+    /// Apply physical-pixel sizing. When false the server reports the desired
+    /// size but allocates the compatibility DPR-1 framebuffer.
+    #[serde(default)]
+    pub hidpi_enabled: bool,
+    /// H.264 profile preference; enhanced profiles still require negotiation.
+    #[serde(default)]
+    pub h264_profile: CodecProfile,
+    /// x264 speed preset (ultrafast/superfast/veryfast/faster).
+    #[serde(default = "default_x264_preset")]
+    pub x264_preset: String,
+    /// Negotiated binary frame header version (1 compatibility, 2 identity).
+    #[serde(default = "default_frame_header_version")]
+    pub frame_header_version: u8,
+    /// Stable experiment/treatment label included in effective descriptors.
+    #[serde(default = "default_treatment_id")]
+    pub treatment_id: String,
+    /// Requested enhanced media transport. WebSocket remains fallback.
+    #[serde(default)]
+    pub media_transport: MediaTransport,
+    /// Capture scheduler treatment.
+    #[serde(default)]
+    pub capture_mode: CaptureMode,
+    /// Congestion controller mode.
+    #[serde(default)]
+    pub congestion_mode: CongestionMode,
+    /// Browser decoder low/high watermarks advertised in the descriptor.
+    #[serde(default = "default_decode_low_watermark")]
+    pub decode_low_watermark: u32,
+    #[serde(default = "default_decode_high_watermark")]
+    pub decode_high_watermark: u32,
+    #[serde(default = "default_max_frame_age_ms")]
+    pub max_frame_age_ms: u32,
+    /// Rich timing sample cadence (0 disables sampled timing).
+    #[serde(default)]
+    pub telemetry_sample_every: u32,
+    /// XOR FEC data packets per parity packet (0 disables FEC).
+    #[serde(default)]
+    pub fec_group_size: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +205,21 @@ impl Default for VideoConfig {
             encoder: None,
             max_width: default_max_width(),
             max_height: default_max_height(),
+            max_pixels: default_max_pixels(),
+            max_dpr: default_max_dpr(),
+            hidpi_enabled: false,
+            h264_profile: CodecProfile::Main,
+            x264_preset: default_x264_preset(),
+            frame_header_version: default_frame_header_version(),
+            treatment_id: default_treatment_id(),
+            media_transport: MediaTransport::Websocket,
+            capture_mode: CaptureMode::FixedRate,
+            congestion_mode: CongestionMode::Off,
+            decode_low_watermark: default_decode_low_watermark(),
+            decode_high_watermark: default_decode_high_watermark(),
+            max_frame_age_ms: default_max_frame_age_ms(),
+            telemetry_sample_every: 0,
+            fec_group_size: 0,
         }
     }
 }
@@ -245,6 +306,16 @@ impl BeamConfig {
             ));
         }
 
+        if self.video.min_bitrate == 0
+            || self.video.min_bitrate > self.video.bitrate
+            || self.video.bitrate > self.video.max_bitrate
+        {
+            issues.push(format!(
+                "ERROR: video bitrate bounds must satisfy 0 < min_bitrate <= bitrate <= max_bitrate ({} <= {} <= {}).",
+                self.video.min_bitrate, self.video.bitrate, self.video.max_bitrate
+            ));
+        }
+
         // --- Framerate ---
         if self.video.framerate == 0 || self.video.framerate > 240 {
             issues.push(format!(
@@ -265,6 +336,71 @@ impl BeamConfig {
                 "ERROR: video.max_height must be 0 (unlimited) or at least 240, got {}.",
                 self.video.max_height
             ));
+        }
+        if self.video.max_pixels != 0 && self.video.max_pixels < 320 * 240 {
+            issues.push("ERROR: video.max_pixels must be 0 or at least 76800.".to_string());
+        }
+        if !self.video.max_dpr.is_finite() || !(0.5..=4.0).contains(&self.video.max_dpr) {
+            issues.push(format!(
+                "ERROR: video.max_dpr must be between 0.5 and 4.0, got {}.",
+                self.video.max_dpr
+            ));
+        }
+        if !matches!(self.video.frame_header_version, 1 | 2) {
+            issues.push(format!(
+                "ERROR: video.frame_header_version must be 1 or 2, got {}.",
+                self.video.frame_header_version
+            ));
+        }
+        if self.video.decode_low_watermark >= self.video.decode_high_watermark {
+            issues.push(
+                "ERROR: video.decode_low_watermark must be less than decode_high_watermark."
+                    .to_string(),
+            );
+        }
+        if !matches!(
+            self.video.x264_preset.as_str(),
+            "ultrafast" | "superfast" | "veryfast" | "faster"
+        ) {
+            issues.push(format!(
+                "ERROR: unsupported video.x264_preset '{}'.",
+                self.video.x264_preset
+            ));
+        }
+        if !matches!(self.video.fec_group_size, 0 | 4 | 8 | 16) {
+            issues.push("ERROR: video.fec_group_size must be 0, 4, 8, or 16.".to_string());
+        }
+        // Enhanced implementations remain explicit treatments. Reject knobs
+        // that this build cannot apply instead of silently running baseline.
+        if self.video.capture_mode != CaptureMode::FixedRate {
+            issues.push("ERROR: this build supports video.capture_mode='fixed_rate' only; XDamage scheduling is not active.".to_string());
+        }
+        if self.video.congestion_mode != CongestionMode::Off {
+            issues.push("ERROR: this build supports video.congestion_mode='off' only; the controller is simulation-only.".to_string());
+        }
+        if self.video.fec_group_size != 0 {
+            issues.push(
+                "ERROR: video.fec_group_size requires an active WebTransport datagram backend."
+                    .to_string(),
+            );
+        }
+        if self.video.telemetry_sample_every != 0 {
+            issues.push(
+                "ERROR: video.telemetry_sample_every is not active in this build; use 0."
+                    .to_string(),
+            );
+        }
+        if self.video.treatment_id.is_empty()
+            || self.video.treatment_id.len() > 64
+            || !self
+                .video
+                .treatment_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            issues.push(
+                "ERROR: video.treatment_id must be 1-64 safe identifier characters.".to_string(),
+            );
         }
 
         // --- Display start ---
@@ -364,6 +500,30 @@ fn default_max_width() -> u32 {
 }
 fn default_max_height() -> u32 {
     2160 // 4K
+}
+fn default_max_pixels() -> u64 {
+    8_294_400 // 3840x2160
+}
+fn default_max_dpr() -> f64 {
+    2.0
+}
+fn default_x264_preset() -> String {
+    "veryfast".to_string()
+}
+fn default_frame_header_version() -> u8 {
+    1
+}
+fn default_treatment_id() -> String {
+    "baseline".to_string()
+}
+fn default_decode_low_watermark() -> u32 {
+    1
+}
+fn default_decode_high_watermark() -> u32 {
+    3
+}
+fn default_max_frame_age_ms() -> u32 {
+    150
 }
 fn default_true() -> bool {
     true
@@ -743,6 +903,7 @@ idle_timeout = 7200
     fn validate_bitrate_over_200k_is_warning() {
         let mut config = valid_config();
         config.video.bitrate = 200_001;
+        config.video.max_bitrate = 250_000;
         let issues = validate_issues(&config);
         assert!(
             has_warning(&issues, "bitrate"),
@@ -758,6 +919,7 @@ idle_timeout = 7200
     fn validate_bitrate_200k_is_ok() {
         let mut config = valid_config();
         config.video.bitrate = 200_000;
+        config.video.max_bitrate = 200_000;
         assert!(config.validate().is_ok());
     }
 
@@ -950,12 +1112,34 @@ idle_timeout = 7200
     fn validate_warnings_only_is_err_with_no_errors() {
         let mut config = valid_config();
         config.video.bitrate = 200_001; // warning only
+        config.video.max_bitrate = 250_000;
         let issues = validate_issues(&config);
         assert!(!issues.is_empty(), "should have warning");
         assert!(
             !issues.iter().any(|i| i.starts_with("ERROR:")),
             "should only contain warnings, not errors"
         );
+    }
+
+    #[test]
+    fn validate_rejects_unwired_treatments_instead_of_silent_noop() {
+        let mut config = valid_config();
+        config.video.capture_mode = CaptureMode::XDamage;
+        config.video.congestion_mode = CongestionMode::Observe;
+        config.video.fec_group_size = 8;
+        config.video.telemetry_sample_every = 60;
+        let issues = validate_issues(&config);
+        for setting in [
+            "capture_mode",
+            "congestion_mode",
+            "fec_group_size",
+            "telemetry_sample_every",
+        ] {
+            assert!(
+                has_error(&issues, setting),
+                "missing explicit error for {setting}: {issues:?}"
+            );
+        }
     }
 
     #[test]

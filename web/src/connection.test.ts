@@ -46,6 +46,50 @@ describe('parseFrameHeader', () => {
     expect(Array.from(result!.payload)).toEqual([0xde, 0xad, 0xbe, 0xef]);
   });
 
+  it('parses negotiated v2 generation, sequence, dependency and timing', () => {
+    const payload = new Uint8Array([1, 2, 3]);
+    const buf = new ArrayBuffer(48 + payload.byteLength);
+    const view = new DataView(buf);
+    view.setUint32(0, FRAME_MAGIC, true);
+    view.setUint8(4, 2);
+    view.setUint8(5, 0);
+    view.setUint16(6, 1920, true);
+    view.setUint16(8, 1080, true);
+    view.setUint16(10, 48, true);
+    view.setBigUint64(12, 10n, true);
+    view.setUint32(20, payload.byteLength, true);
+    view.setUint32(24, 7, true);
+    view.setUint8(28, 1); // reference
+    view.setUint8(29, 0); // H.264
+    view.setUint8(30, 0xff);
+    view.setUint8(31, 0x03);
+    view.setBigUint64(32, 99n, true);
+    view.setUint32(40, 2000, true);
+    view.setUint32(44, 2500, true);
+    new Uint8Array(buf, 48).set(payload);
+
+    const result = parseFrameHeader(buf);
+    expect(result?.header).toMatchObject({ version: 2, headerSize: 48 });
+    expect(result?.header.extension).toEqual({
+      streamGeneration: 7,
+      frameSequence: 99n,
+      dependency: 'reference',
+      codec: 'h264',
+      encodeCompleteDeltaUs: 2000,
+      agentSendDeltaUs: 2500,
+    });
+    expect(Array.from(result!.payload)).toEqual([1, 2, 3]);
+  });
+
+  it('rejects a malformed v2 extension length', () => {
+    const buf = new ArrayBuffer(24);
+    const view = new DataView(buf);
+    view.setUint32(0, FRAME_MAGIC, true);
+    view.setUint8(4, 2);
+    view.setUint16(10, 48, true);
+    expect(parseFrameHeader(buf)).toBeNull();
+  });
+
   it('parses valid audio frame', () => {
     const payload = new Uint8Array([1, 2, 3]);
     const buf = buildFrameBuffer(0x02, 0, 0, 999999n, payload);

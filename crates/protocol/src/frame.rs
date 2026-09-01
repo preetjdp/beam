@@ -1,24 +1,51 @@
 //! Binary video/audio frame header for WebSocket transport.
 //!
-//! 24 bytes, little-endian:
+//! Version 1 is the original 24-byte compatibility header. Version 2 adds a
+//! 24-byte dependency/timing extension while keeping the first 24 bytes stable:
 //! ```text
 //! [0..4]   magic: 0x42454156 ("BEAV")
-//! [4]      version: 1
+//! [4]      version: 1 or 2
 //! [5]      flags: bit 0 = keyframe, bit 1 = audio
 //! [6..8]   width (u16)
 //! [8..10]  height (u16)
-//! [10..12] reserved (u16, must be 0)
-//! [12..20] timestamp_us (u64) — microseconds since capture start
+//! [10..12] v2 header size (48); reserved zero in v1
+//! [12..20] capture timestamp_us (u64)
 //! [20..24] payload_length (u32)
-//! [24..]   payload (H.264 Annex B for video, Opus for audio)
+//! [24..28] stream generation (v2)
+//! [28]     dependency class: key/reference/disposable (v2)
+//! [29]     codec: H.264/HEVC (v2)
+//! [30]     temporal id, 255 when unavailable (v2)
+//! [31]     timing flags (v2)
+//! [32..40] frame sequence (v2)
+//! [40..44] encode-complete delta from capture, microseconds (v2, optional)
+//! [44..48] agent-send delta from capture, microseconds (v2, optional)
+//! [header_size..] payload
 //! ```
 
+use crate::{Codec, DependencyClass};
+
 pub const FRAME_HEADER_SIZE: usize = 24;
+pub const FRAME_V2_HEADER_SIZE: usize = 48;
 pub const FRAME_MAGIC: u32 = 0x5641_4542; // "BEAV" in LE
 pub const FRAME_VERSION: u8 = 1;
+pub const FRAME_VERSION_EXTENDED: u8 = 2;
+
+const TIMING_ENCODE_COMPLETE: u8 = 0x01;
+const TIMING_AGENT_SEND: u8 = 0x02;
 
 pub const FLAG_KEYFRAME: u8 = 0x01;
 pub const FLAG_AUDIO: u8 = 0x02;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameExtension {
+    pub stream_generation: u32,
+    pub frame_sequence: u64,
+    pub dependency: DependencyClass,
+    pub codec: Codec,
+    pub temporal_id: Option<u8>,
+    pub encode_complete_delta_us: Option<u32>,
+    pub agent_send_delta_us: Option<u32>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoFrameHeader {
@@ -27,6 +54,8 @@ pub struct VideoFrameHeader {
     pub height: u16,
     pub timestamp_us: u64,
     pub payload_length: u32,
+    /// Present only for negotiated version-2 frames.
+    pub extension: Option<FrameExtension>,
 }
 
 impl VideoFrameHeader {
@@ -44,6 +73,7 @@ impl VideoFrameHeader {
             height,
             timestamp_us,
             payload_length,
+            extension: None,
         }
     }
 
@@ -55,6 +85,29 @@ impl VideoFrameHeader {
             height: 0,
             timestamp_us,
             payload_length,
+            extension: None,
+        }
+    }
+
+    /// Attach the negotiated version-2 identity/dependency extension.
+    pub fn with_extension(mut self, extension: FrameExtension) -> Self {
+        self.extension = Some(extension);
+        self
+    }
+
+    pub fn version(&self) -> u8 {
+        if self.extension.is_some() {
+            FRAME_VERSION_EXTENDED
+        } else {
+            FRAME_VERSION
+        }
+    }
+
+    pub fn header_size(&self) -> usize {
+        if self.extension.is_some() {
+            FRAME_V2_HEADER_SIZE
+        } else {
+            FRAME_HEADER_SIZE
         }
     }
 
@@ -78,13 +131,41 @@ impl VideoFrameHeader {
         buf[20..24].copy_from_slice(&self.payload_length.to_le_bytes());
     }
 
-    /// Serialize header + payload into a single Vec.
+    /// Serialize header + payload into a single Vec. Version 1 remains byte-for-
+    /// byte compatible; attaching an extension selects version 2.
     pub fn serialize_with_payload(&self, payload: &[u8]) -> Vec<u8> {
-        let mut buf = vec![0u8; FRAME_HEADER_SIZE + payload.len()];
-        let mut header_buf = [0u8; FRAME_HEADER_SIZE];
-        self.serialize(&mut header_buf);
-        buf[..FRAME_HEADER_SIZE].copy_from_slice(&header_buf);
-        buf[FRAME_HEADER_SIZE..].copy_from_slice(payload);
+        let header_size = self.header_size();
+        let mut buf = vec![0u8; header_size + payload.len()];
+        let mut base = [0u8; FRAME_HEADER_SIZE];
+        self.serialize(&mut base);
+        if let Some(ext) = &self.extension {
+            base[4] = FRAME_VERSION_EXTENDED;
+            base[10..12].copy_from_slice(&(FRAME_V2_HEADER_SIZE as u16).to_le_bytes());
+            buf[24..28].copy_from_slice(&ext.stream_generation.to_le_bytes());
+            buf[28] = match ext.dependency {
+                DependencyClass::Key => 0,
+                DependencyClass::Reference => 1,
+                DependencyClass::Disposable => 2,
+            };
+            buf[29] = match ext.codec {
+                Codec::H264 => 0,
+                Codec::Hevc => 1,
+            };
+            buf[30] = ext.temporal_id.unwrap_or(u8::MAX);
+            let mut timing_flags = 0u8;
+            if ext.encode_complete_delta_us.is_some() {
+                timing_flags |= TIMING_ENCODE_COMPLETE;
+            }
+            if ext.agent_send_delta_us.is_some() {
+                timing_flags |= TIMING_AGENT_SEND;
+            }
+            buf[31] = timing_flags;
+            buf[32..40].copy_from_slice(&ext.frame_sequence.to_le_bytes());
+            buf[40..44].copy_from_slice(&ext.encode_complete_delta_us.unwrap_or(0).to_le_bytes());
+            buf[44..48].copy_from_slice(&ext.agent_send_delta_us.unwrap_or(0).to_le_bytes());
+        }
+        buf[..FRAME_HEADER_SIZE].copy_from_slice(&base);
+        buf[header_size..].copy_from_slice(payload);
         buf
     }
 
@@ -100,9 +181,44 @@ impl VideoFrameHeader {
         }
 
         let version = buf[4];
-        if version != FRAME_VERSION {
+        if version != FRAME_VERSION && version != FRAME_VERSION_EXTENDED {
             return Err(FrameError::UnsupportedVersion(version));
         }
+
+        let extension = if version == FRAME_VERSION_EXTENDED {
+            let declared = u16::from_le_bytes([buf[10], buf[11]]) as usize;
+            if declared < FRAME_V2_HEADER_SIZE || buf.len() < declared {
+                return Err(FrameError::MalformedExtension {
+                    declared,
+                    actual: buf.len(),
+                });
+            }
+            let dependency = match buf[28] {
+                0 => DependencyClass::Key,
+                1 => DependencyClass::Reference,
+                2 => DependencyClass::Disposable,
+                value => return Err(FrameError::BadDependency(value)),
+            };
+            let codec = match buf[29] {
+                0 => Codec::H264,
+                1 => Codec::Hevc,
+                value => return Err(FrameError::BadCodec(value)),
+            };
+            let timing_flags = buf[31];
+            Some(FrameExtension {
+                stream_generation: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+                frame_sequence: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
+                dependency,
+                codec,
+                temporal_id: (buf[30] != u8::MAX).then_some(buf[30]),
+                encode_complete_delta_us: (timing_flags & TIMING_ENCODE_COMPLETE != 0)
+                    .then(|| u32::from_le_bytes(buf[40..44].try_into().unwrap())),
+                agent_send_delta_us: (timing_flags & TIMING_AGENT_SEND != 0)
+                    .then(|| u32::from_le_bytes(buf[44..48].try_into().unwrap())),
+            })
+        } else {
+            None
+        };
 
         Ok(Self {
             flags: buf[5],
@@ -112,17 +228,19 @@ impl VideoFrameHeader {
                 buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
             ]),
             payload_length: u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]),
+            extension,
         })
     }
 
     /// Validate that the buffer contains a complete frame (header + payload).
     pub fn validate_complete(buf: &[u8]) -> Result<(), FrameError> {
         let header = Self::deserialize(buf)?;
-        let expected = FRAME_HEADER_SIZE + header.payload_length as usize;
+        let header_size = header.header_size();
+        let expected = header_size + header.payload_length as usize;
         if buf.len() < expected {
             return Err(FrameError::IncompletePayload {
                 expected: header.payload_length as usize,
-                actual: buf.len() - FRAME_HEADER_SIZE,
+                actual: buf.len().saturating_sub(header_size),
             });
         }
         Ok(())
@@ -135,8 +253,14 @@ pub enum FrameError {
     TooShort(usize),
     #[error("bad magic: 0x{0:08x} (expected 0x{FRAME_MAGIC:08x})")]
     BadMagic(u32),
-    #[error("unsupported version: {0} (expected {FRAME_VERSION})")]
+    #[error("unsupported version: {0} (expected 1 or 2)")]
     UnsupportedVersion(u8),
+    #[error("malformed frame extension: declared header {declared} bytes, buffer has {actual}")]
+    MalformedExtension { declared: usize, actual: usize },
+    #[error("invalid dependency class: {0}")]
+    BadDependency(u8),
+    #[error("invalid codec id: {0}")]
+    BadCodec(u8),
     #[error("incomplete payload: expected {expected} bytes, got {actual}")]
     IncompletePayload { expected: usize, actual: usize },
 }
@@ -154,6 +278,39 @@ mod tests {
         assert_eq!(header, parsed);
         assert!(parsed.is_keyframe());
         assert!(!parsed.is_audio());
+    }
+
+    #[test]
+    fn extended_header_roundtrip() {
+        let payload = [1, 2, 3, 4];
+        let header = VideoFrameHeader::video(1920, 1080, 123_456, payload.len() as u32, false)
+            .with_extension(FrameExtension {
+                stream_generation: 7,
+                frame_sequence: 99,
+                dependency: DependencyClass::Reference,
+                codec: Codec::H264,
+                temporal_id: Some(1),
+                encode_complete_delta_us: Some(2_000),
+                agent_send_delta_us: Some(2_500),
+            });
+        let bytes = header.serialize_with_payload(&payload);
+        assert_eq!(bytes.len(), FRAME_V2_HEADER_SIZE + payload.len());
+        let parsed = VideoFrameHeader::deserialize(&bytes).unwrap();
+        assert_eq!(parsed, header);
+        assert_eq!(&bytes[parsed.header_size()..], &payload);
+        assert!(VideoFrameHeader::validate_complete(&bytes).is_ok());
+    }
+
+    #[test]
+    fn malformed_extended_header_is_rejected() {
+        let mut bytes = [0u8; FRAME_HEADER_SIZE];
+        bytes[0..4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+        bytes[4] = FRAME_VERSION_EXTENDED;
+        bytes[10..12].copy_from_slice(&(FRAME_V2_HEADER_SIZE as u16).to_le_bytes());
+        assert!(matches!(
+            VideoFrameHeader::deserialize(&bytes),
+            Err(FrameError::MalformedExtension { .. })
+        ));
     }
 
     #[test]

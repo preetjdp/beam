@@ -2,9 +2,9 @@ use crate::CaptureCommand;
 use crate::h264;
 use crate::signaling::WsSender;
 
-use beam_protocol::VideoFrameHeader;
+use beam_protocol::{Codec, DependencyClass, FrameExtension, VideoFrameHeader};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -29,10 +29,9 @@ pub(crate) enum IdrWaitStep {
     /// wait clock + attempt counter. Used after `idr_wait_attempts > 5` and
     /// `encoder_reset_count < MAX_ENCODER_RESETS`.
     SkipResetEncoderAndCounters,
-    /// Stop waiting and proceed with P-frames. Used after the encoder reset
-    /// threshold is exhausted — fallback so the stream is never permanently
-    /// stuck.
-    ProceedWithPFrames,
+    /// Remain stalled and retry recovery after the normal reset budget is
+    /// exhausted. Sending dependent P-frames here would guarantee corruption.
+    SkipAndRetryRecovery,
     /// Accept this IDR as the first frame and proceed normally.
     AcceptIdr,
     /// Not in waiting state — pass through to the regular send path.
@@ -78,7 +77,7 @@ pub(crate) fn classify_idr_wait_step(inputs: &IdrWaitInputs) -> IdrWaitStep {
             if inputs.encoder_reset_count < inputs.max_encoder_resets {
                 return IdrWaitStep::SkipResetEncoderAndCounters;
             }
-            return IdrWaitStep::ProceedWithPFrames;
+            return IdrWaitStep::SkipAndRetryRecovery;
         }
         return IdrWaitStep::SkipForceKeyframeAndResetClock;
     }
@@ -90,6 +89,7 @@ pub(crate) fn classify_idr_wait_step(inputs: &IdrWaitInputs) -> IdrWaitStep {
 
 /// Write encoded video frames as WebSocket binary messages.
 /// Each frame is prefixed with a 24-byte VideoFrameHeader.
+#[cfg(test)]
 pub(crate) async fn run_video_send_loop(
     encoded_rx: &mut mpsc::Receiver<Vec<u8>>,
     ws_tx: &WsSender,
@@ -99,7 +99,35 @@ pub(crate) async fn run_video_send_loop(
     capture_width: &Arc<std::sync::atomic::AtomicU32>,
     capture_height: &Arc<std::sync::atomic::AtomicU32>,
 ) {
+    let generation = Arc::new(AtomicU32::new(1));
+    run_video_send_loop_extended(
+        encoded_rx,
+        ws_tx,
+        force_keyframe,
+        video_needs_keyframe,
+        capture_cmd_tx,
+        capture_width,
+        capture_height,
+        1,
+        &generation,
+    )
+    .await;
+}
+
+pub(crate) async fn run_video_send_loop_extended(
+    encoded_rx: &mut mpsc::Receiver<Vec<u8>>,
+    ws_tx: &WsSender,
+    force_keyframe: &Arc<AtomicBool>,
+    video_needs_keyframe: &Arc<AtomicBool>,
+    capture_cmd_tx: &std::sync::mpsc::Sender<CaptureCommand>,
+    capture_width: &Arc<std::sync::atomic::AtomicU32>,
+    capture_height: &Arc<std::sync::atomic::AtomicU32>,
+    frame_header_version: u8,
+    stream_generation: &Arc<AtomicU32>,
+) {
     let mut video_frame_count: u64 = 0;
+    let mut frame_sequence: u64 = 0;
+    let mut sequence_generation = stream_generation.load(Ordering::Relaxed);
     let mut waiting_for_idr = true; // Start waiting for first IDR
     let mut idr_wait_start = Instant::now();
     let mut idr_wait_attempts: u32 = 0;
@@ -108,6 +136,14 @@ pub(crate) async fn run_video_send_loop(
     let capture_start = Instant::now();
 
     while let Some(data) = encoded_rx.recv().await {
+        let generation = stream_generation.load(Ordering::Relaxed);
+        if generation != sequence_generation {
+            sequence_generation = generation;
+            frame_sequence = 0;
+            waiting_for_idr = true;
+            idr_wait_start = Instant::now();
+            force_keyframe.store(true, Ordering::Relaxed);
+        }
         let is_idr = h264::h264_contains_idr(&data);
 
         // On browser reconnect / tab foreground, the input callback sets
@@ -182,12 +218,15 @@ pub(crate) async fn run_video_send_loop(
                     idr_wait_attempts = 0;
                     continue;
                 }
-                IdrWaitStep::ProceedWithPFrames => {
+                IdrWaitStep::SkipAndRetryRecovery => {
                     error!(
                         resets = encoder_reset_count,
-                        "Exhausted encoder resets, proceeding with P-frames"
+                        "Exhausted immediate encoder resets; stream stalled awaiting safe recovery"
                     );
-                    waiting_for_idr = false;
+                    force_keyframe.store(true, Ordering::Relaxed);
+                    let _ = capture_cmd_tx.send(CaptureCommand::ResetEncoder);
+                    idr_wait_start = Instant::now();
+                    continue;
                 }
                 IdrWaitStep::AcceptIdr => {
                     info!(
@@ -204,12 +243,29 @@ pub(crate) async fn run_video_send_loop(
             }
         }
 
-        // Build binary frame: VideoFrameHeader + H.264 payload
+        // Build binary frame. Version 2 carries dependency-safe identity on
+        // every frame while version 1 remains the negotiated compatibility path.
         let width = capture_width.load(Ordering::Relaxed) as u16;
         let height = capture_height.load(Ordering::Relaxed) as u16;
         let timestamp_us = capture_start.elapsed().as_micros() as u64;
-        let header =
+        frame_sequence = frame_sequence.wrapping_add(1);
+        let mut header =
             VideoFrameHeader::video(width, height, timestamp_us, data.len() as u32, is_idr);
+        if frame_header_version == 2 {
+            header = header.with_extension(FrameExtension {
+                stream_generation: generation,
+                frame_sequence,
+                dependency: if is_idr {
+                    DependencyClass::Key
+                } else {
+                    DependencyClass::Reference
+                },
+                codec: Codec::H264,
+                temporal_id: None,
+                encode_complete_delta_us: None,
+                agent_send_delta_us: None,
+            });
+        }
         let frame_bytes = header.serialize_with_payload(&data);
 
         match ws_tx.try_send(Message::Binary(frame_bytes.into())) {
@@ -871,24 +927,30 @@ mod tests {
     }
 
     #[test]
-    fn idr_wait_exhausted_resets_proceeds_with_p_frames() {
-        // attempts > threshold AND encoder_reset_count == max → fallback to
-        // P-frames. (Same as 'gave up' state in the production loop.)
+    fn idr_wait_exhausted_resets_remains_stalled() {
+        // attempts > threshold AND encoder_reset_count == max must remain in
+        // recovery; dependent P-frames are never a valid fallback.
         let mut i = wait_inputs();
         i.elapsed_ms = 600;
         i.idr_wait_attempts = 6;
         i.encoder_reset_count = 3;
-        assert_eq!(classify_idr_wait_step(&i), IdrWaitStep::ProceedWithPFrames);
+        assert_eq!(
+            classify_idr_wait_step(&i),
+            IdrWaitStep::SkipAndRetryRecovery
+        );
     }
 
     #[test]
-    fn idr_wait_exhausted_one_over_max_also_proceeds() {
+    fn idr_wait_exhausted_one_over_max_also_retries() {
         // encoder_reset_count > max also exits to P-frames.
         let mut i = wait_inputs();
         i.elapsed_ms = 600;
         i.idr_wait_attempts = 7;
         i.encoder_reset_count = 4;
-        assert_eq!(classify_idr_wait_step(&i), IdrWaitStep::ProceedWithPFrames);
+        assert_eq!(
+            classify_idr_wait_step(&i),
+            IdrWaitStep::SkipAndRetryRecovery
+        );
     }
 
     #[test]
@@ -918,7 +980,7 @@ mod tests {
             IdrWaitStep::SkipAndForceKeyframe,
             IdrWaitStep::SkipForceKeyframeAndResetClock,
             IdrWaitStep::SkipResetEncoderAndCounters,
-            IdrWaitStep::ProceedWithPFrames,
+            IdrWaitStep::SkipAndRetryRecovery,
             IdrWaitStep::AcceptIdr,
             IdrWaitStep::NotWaiting,
         ];

@@ -11,6 +11,7 @@ mod filetransfer;
 mod gpu;
 mod h264;
 mod input;
+mod scheduler;
 mod signaling;
 mod video;
 
@@ -18,7 +19,6 @@ use anyhow::Context;
 use audio::AudioCapture;
 use beam_protocol::InputEvent;
 use capture::ScreenCapture;
-use cli::DEFAULT_FRAMERATE;
 use clipboard::ClipboardBridge;
 use encoder::Encoder;
 use input::InputInjector;
@@ -191,6 +191,8 @@ pub(crate) enum InputAction {
     /// Tab visibility changed. `visible=true` resets the encoder + wakes
     /// the capture thread; `visible=false` just flips the backgrounded flag.
     Visibility { visible: bool },
+    /// Dependency chain was invalidated at the browser/server.
+    RequestRecovery { generation: u32, reason: String },
     /// File transfer start. Forwarded to FileTransferManager.
     FileStart { id: String, name: String, size: u64 },
     /// File transfer chunk. Forwarded to FileTransferManager.
@@ -671,6 +673,20 @@ pub(crate) fn classify_input_event(
                 None => InputAction::Ignore,
             }
         }
+        InputEvent::ResizeIntent { css_w, css_h, .. } => {
+            match display::clamp_resize_dimensions(*css_w, *css_h, max_width, max_height) {
+                Some((cw, ch)) => InputAction::Resize {
+                    width: cw,
+                    height: ch,
+                },
+                None => InputAction::Ignore,
+            }
+        }
+        InputEvent::RequestKeyframe { generation, reason } => InputAction::RequestRecovery {
+            generation: *generation,
+            reason: reason.chars().take(64).collect(),
+        },
+        InputEvent::ClockSync { .. } => InputAction::Ignore,
         InputEvent::Layout { layout } => {
             if is_valid_layout_name(layout) {
                 InputAction::Layout {
@@ -715,6 +731,9 @@ struct InputCallbackCtx {
     display: String,
     max_width: u32,
     max_height: u32,
+    max_pixels: u64,
+    max_dpr: f64,
+    hidpi_enabled: bool,
 }
 
 /// Trait-driven slice of the closure body's mutable state. Holding all
@@ -863,6 +882,13 @@ where
             }
             None
         }
+        InputAction::RequestRecovery { generation, reason } => {
+            info!(generation, reason, "Recovery keyframe requested");
+            channels.video_needs_keyframe.store(true, Ordering::Relaxed);
+            let _ = channels.capture_cmd_tx.send(CaptureCommand::ResetEncoder);
+            dispatch_capture_wake(channels.capture_wake);
+            None
+        }
         InputAction::FileStart { id, name, size } => {
             if let Err(e) = file_sink.handle_file_start(&id, &name, size) {
                 warn!(id, name, "File transfer start error: {e:#}");
@@ -967,6 +993,9 @@ fn build_input_callback(ctx: InputCallbackCtx) -> Arc<dyn Fn(InputEvent) + Send 
         display,
         max_width,
         max_height,
+        max_pixels,
+        max_dpr,
+        hidpi_enabled,
     } = ctx;
     let state = Arc::new(InputDispatchState::new());
 
@@ -979,7 +1008,33 @@ fn build_input_callback(ctx: InputCallbackCtx) -> Arc<dyn Fn(InputEvent) + Send 
             std::time::SystemTime::now(),
         );
 
-        let action = classify_input_event(&event, max_width, max_height);
+        let action = match &event {
+            InputEvent::ResizeIntent {
+                css_w, css_h, dpr, ..
+            } if hidpi_enabled => {
+                let sizing = beam_protocol::compute_effective_sizing(
+                    beam_protocol::SizingIntent {
+                        css_width: *css_w,
+                        css_height: *css_h,
+                        device_pixel_ratio: *dpr,
+                        render_scale: 1.0,
+                    },
+                    beam_protocol::SizingLimits {
+                        max_width,
+                        max_height,
+                        max_pixels,
+                        max_dpr,
+                        alignment: 2,
+                    },
+                    None,
+                );
+                InputAction::Resize {
+                    width: sizing.encoded_width,
+                    height: sizing.encoded_height,
+                }
+            }
+            _ => classify_input_event(&event, max_width, max_height),
+        };
         let channels = InputDispatchChannels {
             resize_tx: &resize_tx,
             clipboard_read_tx: &clipboard_read_tx,
@@ -1032,6 +1087,10 @@ async fn main() -> anyhow::Result<()> {
         display = %args.display,
         session_id = %args.session_id,
         server_url = %args.server_url,
+        treatment_id = %args.treatment_id,
+        frame_header_version = args.frame_header_version,
+        h264_profile = %args.h264_profile,
+        x264_preset = %args.x264_preset,
         "Starting beam-agent"
     );
 
@@ -1107,6 +1166,8 @@ async fn main() -> anyhow::Result<()> {
     // Attempting 120fps causes the appsrc queue to grow faster than the
     // encoder drains it, leading to OOM.
     let encoder_pref = args.encoder.clone();
+    let h264_profile = args.h264_profile.clone();
+    let x264_preset = args.x264_preset.clone();
     let (encoder_type, _) = encoder::detect_encoder_type(args.encoder.as_deref())?;
     let (config_framerate, config_bitrate) =
         cap_software_encoder_params(encoder_type, args.framerate, args.bitrate);
@@ -1120,12 +1181,14 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let encoder = Encoder::with_encoder_preference(
+    let encoder = Encoder::with_quality_options(
         width,
         height,
         config_framerate,
         config_bitrate,
         args.encoder.as_deref(),
+        &args.h264_profile,
+        &args.x264_preset,
     )
     .context("Failed to initialize encoder")?;
 
@@ -1172,6 +1235,7 @@ async fn main() -> anyhow::Result<()> {
     // force_keyframe because the capture thread clears that one immediately
     // (via swap) before the video send loop can see it.
     let video_needs_keyframe = Arc::new(AtomicBool::new(false));
+    let stream_generation = Arc::new(std::sync::atomic::AtomicU32::new(1));
 
     // Command channel for non-latency-critical capture thread operations
     let (capture_cmd_tx, capture_cmd_rx) = std::sync::mpsc::channel::<CaptureCommand>();
@@ -1227,6 +1291,9 @@ async fn main() -> anyhow::Result<()> {
         display: args.display.clone(),
         max_width: args.max_width,
         max_height: args.max_height,
+        max_pixels: args.max_pixels,
+        max_dpr: args.max_dpr,
+        hidpi_enabled: args.hidpi_enabled,
     });
 
     // Shutdown flag for capture/audio threads
@@ -1246,6 +1313,7 @@ async fn main() -> anyhow::Result<()> {
     let capture_wake_for_thread = Arc::clone(&capture_wake);
     let input_width_for_capture = Arc::clone(&input_width);
     let input_height_for_capture = Arc::clone(&input_height);
+    let video_needs_keyframe_for_capture = Arc::clone(&video_needs_keyframe);
 
     let capture_handle = std::thread::Builder::new()
         .name("capture-encode".into())
@@ -1357,12 +1425,14 @@ async fn main() -> anyhow::Result<()> {
                         info!("Dropping old encoder to free NVENC session");
                         drop(encoder);
                         info!("Old encoder dropped, creating new pipeline");
-                        encoder = match Encoder::with_encoder_preference(
+                        encoder = match Encoder::with_quality_options(
                             screen_capture.width(),
                             screen_capture.height(),
                             current_framerate,
                             current_bitrate,
                             encoder_pref.as_deref(),
+                            &h264_profile,
+                            &x264_preset,
                         ) {
                             Ok(enc) => enc,
                             Err(e) => {
@@ -1380,9 +1450,11 @@ async fn main() -> anyhow::Result<()> {
                         info!(width = new_w, height = new_h, "Dropping old encoder for resize");
                         drop(encoder);
                         info!("Old encoder dropped, creating new pipeline for resize");
-                        encoder = match Encoder::with_encoder_preference(
-                            new_w, new_h, DEFAULT_FRAMERATE, current_bitrate,
+                        encoder = match Encoder::with_quality_options(
+                            new_w, new_h, current_framerate, current_bitrate,
                             encoder_pref.as_deref(),
+                            &h264_profile,
+                            &x264_preset,
                         ) {
                             Ok(enc) => enc,
                             Err(e) => {
@@ -1456,10 +1528,12 @@ async fn main() -> anyhow::Result<()> {
                 if encoder.has_error() {
                     warn!("GStreamer pipeline error detected, dropping encoder");
                     drop(encoder);
-                    match Encoder::with_encoder_preference(
+                    match Encoder::with_quality_options(
                         screen_capture.width(), screen_capture.height(),
                         current_framerate, current_bitrate,
                         encoder_pref.as_deref(),
+                        &h264_profile,
+                        &x264_preset,
                     ) {
                         Ok(enc) => {
                             encoder = enc;
@@ -1526,7 +1600,11 @@ async fn main() -> anyhow::Result<()> {
                             match encoded_tx.try_send(data) {
                                 Ok(()) => {}
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                    debug!("Dropping encoded frame (channel full, prioritizing latency)");
+                                    // Every current IPPP inter frame may be referenced. Once
+                                    // handoff drops one, gate all deltas and force recovery.
+                                    video_needs_keyframe_for_capture.store(true, Ordering::Relaxed);
+                                    encoder.force_keyframe();
+                                    debug!("Dropping encoded frame (channel full), entering keyframe recovery");
                                 }
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                                     info!("Encoded frame channel closed, stopping capture");
@@ -1660,6 +1738,8 @@ async fn main() -> anyhow::Result<()> {
     let cmd_tx_for_video = capture_cmd_tx.clone();
     let cmd_tx_for_resize = capture_cmd_tx;
     let clipboard_for_sync = Arc::clone(&clipboard);
+    let generation_for_video = Arc::clone(&stream_generation);
+    let generation_for_resize = Arc::clone(&stream_generation);
 
     // WS sender clones for tasks that need to send messages
     let ws_tx_for_cursor = ws_outbox_tx.clone();
@@ -1677,7 +1757,7 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::select! {
         // Write encoded video frames as WebSocket binary
-        _ = video::run_video_send_loop(
+        _ = video::run_video_send_loop_extended(
             &mut encoded_rx,
             &ws_outbox_tx,
             &force_keyframe,
@@ -1685,6 +1765,8 @@ async fn main() -> anyhow::Result<()> {
             &cmd_tx_for_video,
             &input_width,
             &input_height,
+            args.frame_header_version,
+            &generation_for_video,
         ) => {}
 
         // Write encoded audio frames as WebSocket binary
@@ -1702,7 +1784,8 @@ async fn main() -> anyhow::Result<()> {
         // Forward resize requests to capture thread
         _ = async {
             while let Some((w, h)) = resize_rx.recv().await {
-                info!(w, h, "Resize requested, forwarding to capture thread");
+                let generation = generation_for_resize.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                info!(w, h, generation, "Resize requested, forwarding to capture thread");
                 let _ = cmd_tx_for_resize.send(CaptureCommand::Resize { width: w, height: h });
             }
         } => {}

@@ -37,11 +37,21 @@ export class WebCodecsRenderer {
   private audioFramesDecoded = 0;
   private audioDropouts = 0;
   private audioBufferDelayMs = 0;
+  private videoFramesReceived = 0;
+  private videoFramesPresented = 0;
+  private pendingDecodeFeeds = new Map<number, number>();
+  private oldestFrameAgeMs = 0;
+  private presentationSubmitMs = 0;
+  private streamGeneration = 0;
+  private recoveryNeededCallback: ((generation: number, reason: string) => void) | null = null;
+  private recoveryRequestOutstanding = false;
+  private readonly decodeHighWatermark = 3;
+  private readonly maxFrameAgeMs = 150;
 
   constructor(canvas: HTMLCanvasElement, containerElement: HTMLElement) {
     this.canvas = canvas;
     this.containerElement = containerElement;
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
     if (!ctx) throw new Error('Failed to get 2d context from canvas');
     this.ctx = ctx;
 
@@ -58,6 +68,18 @@ export class WebCodecsRenderer {
         { once: true }
       );
     }
+  }
+
+  setStreamGeneration(generation: number): void {
+    if (generation === this.streamGeneration) return;
+    this.streamGeneration = generation;
+    this.pendingDecodeFeeds.clear();
+    this.needsKeyframe = true;
+    this.recoveryRequestOutstanding = false;
+  }
+
+  onRecoveryNeeded(callback: (generation: number, reason: string) => void): void {
+    this.recoveryNeededCallback = callback;
   }
 
   /** Register callback for the first decoded video frame */
@@ -137,10 +159,19 @@ export class WebCodecsRenderer {
 
     this.decoder = new VideoDecoder({
       output: (frame: VideoFrame) => {
-        this.ctx.drawImage(frame, 0, 0);
-        frame.close();
-        this.framesDecoded++;
-        this.decodeTimeMs = performance.now() - this.lastFeedTimeMs;
+        const outputAt = performance.now();
+        const feedAt = this.pendingDecodeFeeds.get(frame.timestamp);
+        this.pendingDecodeFeeds.delete(frame.timestamp);
+        if (feedAt !== undefined) this.decodeTimeMs = outputAt - feedAt;
+        try {
+          this.ctx.drawImage(frame, 0, 0);
+          this.presentationSubmitMs = performance.now() - outputAt;
+          this.framesDecoded++;
+          this.videoFramesPresented++;
+        } finally {
+          frame.close();
+        }
+        this.updateQueueAge();
 
         if (!this.firstFrameFired) {
           console.log(
@@ -161,6 +192,7 @@ export class WebCodecsRenderer {
       optimizeForLatency: true,
     });
     this.needsKeyframe = true;
+    this.pendingDecodeFeeds.clear();
 
     this.startFpsCounter();
   }
@@ -174,6 +206,7 @@ export class WebCodecsRenderer {
     payload: Uint8Array
   ): void {
     this.videoFrameCount++;
+    this.videoFramesReceived++;
     if (this.videoFrameCount <= 5) {
       const isKf = (flags & 0x01) !== 0;
       console.log(
@@ -182,6 +215,21 @@ export class WebCodecsRenderer {
     }
 
     const isKeyframe = (flags & 0x01) !== 0;
+
+    // Current H.264 IPPP frames are all references. Once queued work becomes
+    // stale we reset the chain rather than dropping one P-frame and decoding
+    // dependants into corruption.
+    if (this.decoder && !isKeyframe) {
+      this.updateQueueAge();
+      if (
+        this.decoder.decodeQueueSize > this.decodeHighWatermark ||
+        this.oldestFrameAgeMs > this.maxFrameAgeMs
+      ) {
+        this.enterRecovery('browser_decode_pressure');
+        this.videoFramesDropped++;
+        return;
+      }
+    }
 
     // Reconfigure decoder if resolution changed
     if (width !== this.currentWidth || height !== this.currentHeight) {
@@ -212,7 +260,10 @@ export class WebCodecsRenderer {
       this.videoFramesDropped++;
       return;
     }
-    if (isKeyframe) this.needsKeyframe = false;
+    if (isKeyframe) {
+      this.needsKeyframe = false;
+      this.recoveryRequestOutstanding = false;
+    }
 
     const chunk = new EncodedVideoChunk({
       type: isKeyframe ? 'key' : 'delta',
@@ -222,10 +273,35 @@ export class WebCodecsRenderer {
 
     try {
       this.lastFeedTimeMs = performance.now();
+      this.pendingDecodeFeeds.set(Number(timestampUs), this.lastFeedTimeMs);
       this.decoder.decode(chunk);
+      this.updateQueueAge();
     } catch (err) {
       this.videoFramesDropped++;
       console.error('VideoDecoder.decode() error:', err);
+    }
+  }
+
+  private updateQueueAge(): void {
+    const now = performance.now();
+    let oldest = now;
+    for (const queuedAt of this.pendingDecodeFeeds.values()) oldest = Math.min(oldest, queuedAt);
+    this.oldestFrameAgeMs = this.pendingDecodeFeeds.size > 0 ? now - oldest : 0;
+  }
+
+  private enterRecovery(reason: string): void {
+    if (this.decoder?.state === 'configured') {
+      try {
+        this.decoder.reset();
+      } catch {
+        // A concurrent decoder error may already have closed it.
+      }
+    }
+    this.pendingDecodeFeeds.clear();
+    this.needsKeyframe = true;
+    if (!this.recoveryRequestOutstanding) {
+      this.recoveryRequestOutstanding = true;
+      this.recoveryNeededCallback?.(this.streamGeneration, reason);
     }
   }
 
@@ -322,6 +398,12 @@ export class WebCodecsRenderer {
       audioFramesDecodedTotal: this.audioFramesDecoded,
       audioDropoutsTotal: this.audioDropouts,
       audioBufferDelayMs: this.audioBufferDelayMs,
+      videoFramesReceivedTotal: this.videoFramesReceived,
+      videoFramesPresentedTotal: this.videoFramesPresented,
+      decodeQueueSize: this.decoder?.decodeQueueSize ?? 0,
+      oldestFrameAgeMs: this.oldestFrameAgeMs,
+      presentationSubmitMs: this.presentationSubmitMs,
+      streamGeneration: this.streamGeneration,
     };
   }
 
@@ -380,6 +462,12 @@ export class WebCodecsRenderer {
     this.audioFramesDecoded = 0;
     this.audioDropouts = 0;
     this.audioBufferDelayMs = 0;
+    this.videoFramesReceived = 0;
+    this.videoFramesPresented = 0;
+    this.pendingDecodeFeeds.clear();
+    this.oldestFrameAgeMs = 0;
+    this.presentationSubmitMs = 0;
+    this.recoveryRequestOutstanding = false;
   }
 
   private startFpsCounter(): void {

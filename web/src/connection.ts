@@ -17,16 +17,34 @@
  *   [24..]   payload
  */
 
+import type { StreamDescriptor } from './session';
+
 export const FRAME_HEADER_SIZE = 24;
+export const FRAME_V2_HEADER_SIZE = 48;
 export const FRAME_MAGIC = 0x56414542; // "BEAV" in little-endian
 
 /** Parsed binary frame header */
+export type DependencyClass = 'key' | 'reference' | 'disposable';
+
+export interface FrameExtension {
+  streamGeneration: number;
+  frameSequence: bigint;
+  dependency: DependencyClass;
+  codec: 'h264' | 'hevc';
+  temporalId?: number;
+  encodeCompleteDeltaUs?: number;
+  agentSendDeltaUs?: number;
+}
+
 export interface FrameHeader {
+  version: number;
+  headerSize: number;
   flags: number;
   width: number;
   height: number;
   timestampUs: bigint;
   payloadLength: number;
+  extension?: FrameExtension;
 }
 
 /**
@@ -46,19 +64,46 @@ export function parseFrameHeader(
     return null;
   }
 
+  const version = view.getUint8(4);
+  if (version !== 1 && version !== 2) return null;
+  const headerSize = version === 2 ? view.getUint16(10, true) : FRAME_HEADER_SIZE;
+  if (headerSize < FRAME_HEADER_SIZE || headerSize > data.byteLength) return null;
+  if (version === 2 && headerSize < FRAME_V2_HEADER_SIZE) return null;
+
   const flags = view.getUint8(5);
   const width = view.getUint16(6, true);
   const height = view.getUint16(8, true);
   const timestampUs = view.getBigUint64(12, true);
   const payloadLength = view.getUint32(20, true);
 
-  const expectedSize = FRAME_HEADER_SIZE + payloadLength;
+  const expectedSize = headerSize + payloadLength;
   if (data.byteLength < expectedSize) {
     return null;
   }
 
-  const payload = new Uint8Array(data, FRAME_HEADER_SIZE, payloadLength);
-  return { header: { flags, width, height, timestampUs, payloadLength }, payload };
+  let extension: FrameExtension | undefined;
+  if (version === 2) {
+    const dependencyByte = view.getUint8(28);
+    const codecByte = view.getUint8(29);
+    if (dependencyByte > 2 || codecByte > 1) return null;
+    const timingFlags = view.getUint8(31);
+    const temporalId = view.getUint8(30);
+    extension = {
+      streamGeneration: view.getUint32(24, true),
+      frameSequence: view.getBigUint64(32, true),
+      dependency: (['key', 'reference', 'disposable'] as const)[dependencyByte],
+      codec: codecByte === 0 ? 'h264' : 'hevc',
+      ...(temporalId === 0xff ? {} : { temporalId }),
+      ...(timingFlags & 0x01 ? { encodeCompleteDeltaUs: view.getUint32(40, true) } : {}),
+      ...(timingFlags & 0x02 ? { agentSendDeltaUs: view.getUint32(44, true) } : {}),
+    };
+  }
+
+  const payload = new Uint8Array(data, headerSize, payloadLength);
+  return {
+    header: { version, headerSize, flags, width, height, timestampUs, payloadLength, extension },
+    payload,
+  };
 }
 
 /**
@@ -74,6 +119,9 @@ export type InputEvent =
   | { t: 'c'; text: string }
   | { t: 'cp'; text: string }
   | { t: 'r'; w: number; h: number }
+  | { t: 'ri'; css_w: number; css_h: number; dpr: number; request_generation: number }
+  | { t: 'rk'; generation: number; reason: string }
+  | { t: 'cs'; id: number; t0_us: number }
   | { t: 'l'; layout: string }
   | { t: 'q'; mode: string }
   | { t: 'vs'; visible: boolean }
@@ -110,6 +158,13 @@ export interface RendererQualitySnapshot {
   audioFramesDecodedTotal: number;
   audioDropoutsTotal: number;
   audioBufferDelayMs?: number;
+  videoFramesReceivedTotal?: number;
+  videoFramesPresentedTotal?: number;
+  decodeQueueSize?: number;
+  oldestFrameAgeMs?: number;
+  presentationSubmitMs?: number;
+  workerEventLoopLagMs?: number;
+  streamGeneration?: number;
 }
 
 type ClientMetricsReport = {
@@ -125,6 +180,15 @@ type ClientMetricsReport = {
   audio_frames_decoded_total: number;
   audio_dropouts_total: number;
   audio_buffer_delay_ms?: number;
+  video_frames_received_total: number;
+  video_frames_presented_total: number;
+  sequence_gaps_total: number;
+  recovery_requests_total: number;
+  decode_queue_size?: number;
+  oldest_frame_age_ms?: number;
+  presentation_submit_ms?: number;
+  worker_event_loop_lag_ms?: number;
+  stream_generation?: number;
 };
 
 const MAX_RECONNECT_DELAY_MS = 30_000;
@@ -149,8 +213,17 @@ export class BeamConnection {
   private audioBytesThisSecond = 0;
   private metricsPingId = 0;
   private pendingMetricPings = new Map<number, number>();
+  private pendingClockSync = new Map<number, number>();
+  private clockOffsetUs: number | null = null;
+  private clockUncertaintyUs: number | null = null;
   private latencyMs: number | null = null;
   private jitterMs: number | null = null;
+  private activeGeneration: number | null = null;
+  private lastVideoSequence: bigint | null = null;
+  private awaitingRecovery = false;
+  private recoveryRequestsTotal = 0;
+  private sequenceGapsTotal = 0;
+  private streamDescriptor: StreamDescriptor | null = null;
 
   // Callbacks
   private videoFrameCallback: VideoFrameCallback | null = null;
@@ -162,6 +235,7 @@ export class BeamConnection {
   private agentMessageCallback: ((msg: InputEvent) => void) | null = null;
   private replacedCallback: VoidCallback | null = null;
   private agentExitedCallback: VoidCallback | null = null;
+  private streamDescriptorCallback: ((descriptor: StreamDescriptor) => void) | null = null;
 
   constructor(sessionId: string, token: string) {
     this.sessionId = sessionId;
@@ -213,6 +287,18 @@ export class BeamConnection {
     this.agentExitedCallback = callback;
   }
 
+  onStreamDescriptor(callback: (descriptor: StreamDescriptor) => void): void {
+    this.streamDescriptorCallback = callback;
+    if (this.streamDescriptor) callback(this.streamDescriptor);
+  }
+
+  setInitialStreamDescriptor(descriptor: StreamDescriptor | undefined): void {
+    if (!descriptor) return;
+    this.streamDescriptor = descriptor;
+    this.activeGeneration = descriptor.stream_generation;
+    this.streamDescriptorCallback?.(descriptor);
+  }
+
   /** Update the token (after refresh) so reconnections use the new one */
   updateToken(token: string): void {
     this.token = token;
@@ -256,6 +342,7 @@ export class BeamConnection {
     }
     this.metricsSnapshotProvider = null;
     this.pendingMetricPings.clear();
+    this.pendingClockSync.clear();
     this.videoBytesThisSecond = 0;
     this.audioBytesThisSecond = 0;
     this.latencyMs = null;
@@ -333,6 +420,7 @@ export class BeamConnection {
       this.audioFrameCallback?.(header.timestampUs, payload);
     } else {
       this.videoBytesThisSecond += data.byteLength;
+      if (!this.admitVideoHeader(header)) return;
       this.videoFrameCallback?.(
         header.flags,
         header.width,
@@ -341,6 +429,55 @@ export class BeamConnection {
         payload
       );
     }
+  }
+
+  private admitVideoHeader(header: FrameHeader): boolean {
+    const ext = header.extension;
+    if (!ext) return true; // negotiated compatibility stream
+
+    const isKey = ext.dependency === 'key' || (header.flags & 0x01) !== 0;
+    if (this.activeGeneration === null || ext.streamGeneration > this.activeGeneration) {
+      this.activeGeneration = ext.streamGeneration;
+      this.lastVideoSequence = null;
+      this.awaitingRecovery = true;
+      if (this.streamDescriptor) {
+        const sizing = this.streamDescriptor.sizing;
+        this.streamDescriptor = {
+          ...this.streamDescriptor,
+          stream_generation: ext.streamGeneration,
+          sizing: {
+            ...sizing,
+            encoded_width: header.width,
+            encoded_height: header.height,
+            effective_dpr_x: header.width / Math.max(1, sizing.css_width),
+            effective_dpr_y: header.height / Math.max(1, sizing.css_height),
+          },
+        };
+        this.streamDescriptorCallback?.(this.streamDescriptor);
+      }
+    } else if (ext.streamGeneration < this.activeGeneration) {
+      return false;
+    }
+
+    const expected = this.lastVideoSequence === null ? null : this.lastVideoSequence + 1n;
+    if (expected !== null && ext.frameSequence !== expected && !isKey) {
+      this.sequenceGapsTotal++;
+      this.awaitingRecovery = true;
+      this.requestRecovery(ext.streamGeneration, 'browser_sequence_gap');
+      this.lastVideoSequence = ext.frameSequence;
+      return false;
+    }
+    this.lastVideoSequence = ext.frameSequence;
+
+    if (this.awaitingRecovery && !isKey) return false;
+    if (isKey) this.awaitingRecovery = false;
+    return true;
+  }
+
+  private requestRecovery(generation: number, reason: string): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.recoveryRequestsTotal++;
+    this.ws.send(JSON.stringify({ t: 'rk', generation, reason }));
   }
 
   /** Handle incoming JSON text messages (signaling + agent messages) */
@@ -357,8 +494,23 @@ export class BeamConnection {
     const msg = parsed as Record<string, unknown>;
 
     // Server signaling messages
+    if (msg['type'] === 'clock_sync_reply') {
+      this.handleClockSyncReply(msg);
+      return;
+    }
+
     if (msg['type'] === 'metrics_pong') {
       this.handleMetricsPong(msg);
+      return;
+    }
+
+    if (msg['type'] === 'stream_descriptor' && typeof msg['descriptor'] === 'object') {
+      const descriptor = msg['descriptor'] as StreamDescriptor;
+      this.streamDescriptor = descriptor;
+      this.activeGeneration = descriptor.stream_generation;
+      this.lastVideoSequence = null;
+      this.awaitingRecovery = true;
+      this.streamDescriptorCallback?.(descriptor);
       return;
     }
 
@@ -395,11 +547,37 @@ export class BeamConnection {
     const sentMs = performance.now();
     this.pendingMetricPings.set(id, sentMs);
     this.ws.send(JSON.stringify({ t: 'mp', id, sent_ms: sentMs }));
+    const t0Us = Math.round(performance.now() * 1000);
+    this.pendingClockSync.set(id, t0Us);
+    this.ws.send(JSON.stringify({ t: 'cs', id, t0_us: t0Us }));
 
     if (this.pendingMetricPings.size > 32) {
       const oldest = this.pendingMetricPings.keys().next().value;
-      if (oldest !== undefined) this.pendingMetricPings.delete(oldest);
+      if (oldest !== undefined) {
+        this.pendingMetricPings.delete(oldest);
+        this.pendingClockSync.delete(oldest);
+      }
     }
+  }
+
+  private handleClockSyncReply(msg: Record<string, unknown>): void {
+    const id = typeof msg['id'] === 'number' ? msg['id'] : null;
+    const t1 = typeof msg['t1_us'] === 'number' ? msg['t1_us'] : null;
+    const t2 = typeof msg['t2_us'] === 'number' ? msg['t2_us'] : null;
+    if (id === null || t1 === null || t2 === null) return;
+    const t0 = this.pendingClockSync.get(id);
+    if (t0 === undefined || t2 < t1) return;
+    this.pendingClockSync.delete(id);
+    const t3 = Math.round(performance.now() * 1000);
+    if (t3 < t0) return;
+    const networkRtt = Math.max(0, t3 - t0 - (t2 - t1));
+    this.clockOffsetUs = (t1 - t0 + (t2 - t3)) / 2;
+    this.clockUncertaintyUs = Math.max(1, networkRtt / 2);
+  }
+
+  getClockEstimate(): { offsetUs: number; uncertaintyUs: number } | null {
+    if (this.clockOffsetUs === null || this.clockUncertaintyUs === null) return null;
+    return { offsetUs: this.clockOffsetUs, uncertaintyUs: this.clockUncertaintyUs };
   }
 
   private handleMetricsPong(msg: Record<string, unknown>): void {
@@ -431,6 +609,10 @@ export class BeamConnection {
       video_frames_dropped_total: snapshot.videoFramesDroppedTotal,
       audio_frames_decoded_total: snapshot.audioFramesDecodedTotal,
       audio_dropouts_total: snapshot.audioDropoutsTotal,
+      video_frames_received_total: snapshot.videoFramesReceivedTotal ?? 0,
+      video_frames_presented_total: snapshot.videoFramesPresentedTotal ?? 0,
+      sequence_gaps_total: this.sequenceGapsTotal,
+      recovery_requests_total: this.recoveryRequestsTotal,
     };
 
     addFiniteMetric(report, 'latency_ms', this.latencyMs);
@@ -438,6 +620,11 @@ export class BeamConnection {
     addFiniteMetric(report, 'fps', snapshot.fps);
     addFiniteMetric(report, 'decode_ms', snapshot.decodeMs);
     addFiniteMetric(report, 'audio_buffer_delay_ms', snapshot.audioBufferDelayMs);
+    addFiniteMetric(report, 'decode_queue_size', snapshot.decodeQueueSize);
+    addFiniteMetric(report, 'oldest_frame_age_ms', snapshot.oldestFrameAgeMs);
+    addFiniteMetric(report, 'presentation_submit_ms', snapshot.presentationSubmitMs);
+    addFiniteMetric(report, 'worker_event_loop_lag_ms', snapshot.workerEventLoopLagMs);
+    addFiniteMetric(report, 'stream_generation', snapshot.streamGeneration);
 
     this.videoBytesThisSecond = 0;
     this.audioBytesThisSecond = 0;

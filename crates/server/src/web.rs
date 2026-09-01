@@ -6,7 +6,11 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use beam_protocol::{AuthRequest, AuthResponse, BeamConfig, SignalingMessage};
+use beam_protocol::{
+    AuthRequest, AuthResponse, BeamConfig, Codec, EffectiveSizing, ExperimentManifest,
+    MediaTransport, SignalingMessage, SizingIntent, SizingLimits, StreamDescriptor,
+    compute_effective_sizing,
+};
 use serde::Deserialize;
 use serde_json::json;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -354,6 +358,96 @@ fn extract_claims_from_headers(
 
 /// Validate that a username is non-empty, at most 64 chars, and contains only
 /// alphanumeric ASCII characters plus `_`, `-`, and `.`.
+fn initial_stream_descriptor(req: &AuthRequest, config: &BeamConfig) -> StreamDescriptor {
+    let capabilities = req.capabilities.clone().sanitized();
+    let css_width = req.viewport_width.unwrap_or(config.session.default_width);
+    let css_height = req.viewport_height.unwrap_or(config.session.default_height);
+    let requested_dpr = req.device_pixel_ratio.unwrap_or(1.0);
+    let applied_dpr = if config.video.hidpi_enabled {
+        requested_dpr
+    } else {
+        1.0
+    };
+    let mut sizing = compute_effective_sizing(
+        SizingIntent {
+            css_width,
+            css_height,
+            device_pixel_ratio: applied_dpr,
+            render_scale: 1.0,
+        },
+        SizingLimits {
+            max_width: config.video.max_width,
+            max_height: config.video.max_height,
+            max_pixels: config.video.max_pixels,
+            max_dpr: config.video.max_dpr,
+            alignment: 2,
+        },
+        Some(&capabilities),
+    );
+    sizing.requested_dpr = requested_dpr.clamp(0.5, 4.0);
+    if !config.video.hidpi_enabled && requested_dpr > 1.0 {
+        sizing
+            .limiting_reasons
+            .push("hidpi_observe_only".to_string());
+    }
+
+    let mut fallback_reasons = Vec::new();
+    let frame_header_version =
+        if config.video.frame_header_version == 2 && capabilities.supports_header(2) {
+            2
+        } else {
+            if config.video.frame_header_version == 2 {
+                fallback_reasons.push("client_frame_header_v2_unsupported".to_string());
+            }
+            1
+        };
+    if config.video.media_transport != MediaTransport::Websocket {
+        fallback_reasons.push("enhanced_media_transport_not_active".to_string());
+    }
+
+    StreamDescriptor {
+        stream_generation: 1,
+        codec: Codec::H264,
+        profile: config.video.h264_profile,
+        encoder: config
+            .video
+            .encoder
+            .clone()
+            .unwrap_or_else(|| "auto".to_string()),
+        media_transport: MediaTransport::Websocket,
+        sizing,
+        fps_target: config.video.framerate,
+        bitrate_kbps: config.video.bitrate,
+        treatment_id: config.video.treatment_id.clone(),
+        frame_header_version,
+        fallback_reasons,
+        ..StreamDescriptor::default()
+    }
+}
+
+fn log_effective_manifest(session_id: Uuid, stream: &StreamDescriptor) {
+    let manifest = ExperimentManifest {
+        schema_version: beam_protocol::EXPERIMENT_SCHEMA_VERSION,
+        treatment_id: stream.treatment_id.clone(),
+        beam_version: env!("CARGO_PKG_VERSION").to_string(),
+        beam_commit: option_env!("BEAM_GIT_COMMIT").map(str::to_string),
+        workload_id: None,
+        network_profile: None,
+        stream: stream.clone(),
+    };
+    if let Ok(json) = manifest.canonical_json() {
+        tracing::info!(%session_id, effective_manifest = %json, "Effective stream manifest");
+    }
+}
+
+fn descriptor_for_existing(
+    mut descriptor: StreamDescriptor,
+    sizing: EffectiveSizing,
+) -> StreamDescriptor {
+    descriptor.sizing = sizing;
+    descriptor
+}
+
 fn is_valid_username(username: &str) -> bool {
     !username.is_empty()
         && username.len() <= 64
@@ -510,6 +604,8 @@ async fn login(
         }
     }
 
+    let requested_descriptor = initial_stream_descriptor(&req, &state.config);
+
     // Generate JWT
     let token = match auth::generate_jwt(&req.username, &state.jwt_secret) {
         Ok(t) => t,
@@ -543,6 +639,25 @@ async fn login(
             .get_idle_timeout(existing.id, state.config.session.idle_timeout)
             .await;
 
+        let css_width = req.viewport_width.unwrap_or(existing.width).max(1);
+        let css_height = req.viewport_height.unwrap_or(existing.height).max(1);
+        let mut existing_sizing = requested_descriptor.sizing.clone();
+        existing_sizing.encoded_width = existing.width;
+        existing_sizing.encoded_height = existing.height;
+        existing_sizing.effective_dpr_x = existing.width as f64 / css_width as f64;
+        existing_sizing.effective_dpr_y = existing.height as f64 / css_height as f64;
+        if !existing_sizing
+            .limiting_reasons
+            .iter()
+            .any(|r| r == "existing_session")
+        {
+            existing_sizing
+                .limiting_reasons
+                .push("existing_session".to_string());
+        }
+        let descriptor = descriptor_for_existing(requested_descriptor.clone(), existing_sizing);
+        log_effective_manifest(existing.id, &descriptor);
+
         return (
             StatusCode::OK,
             Json(json!(AuthResponse {
@@ -551,6 +666,7 @@ async fn login(
                 release_token,
                 idle_timeout: Some(effective_timeout),
                 client_metrics_enabled: state.config.server.client_metrics_enabled,
+                stream_descriptor: Some(descriptor),
             })),
         )
             .into_response();
@@ -572,8 +688,8 @@ async fn login(
             &req.username,
             &server_url,
             max_sessions,
-            req.viewport_width,
-            req.viewport_height,
+            Some(requested_descriptor.sizing.encoded_width),
+            Some(requested_descriptor.sizing.encoded_height),
             req.idle_timeout,
         )
         .await
@@ -610,6 +726,7 @@ async fn login(
         .get_idle_timeout(session.id, state.config.session.idle_timeout)
         .await;
 
+    log_effective_manifest(session.id, &requested_descriptor);
     tracing::info!(
         session_id = %session.id,
         username = %req.username,
@@ -626,6 +743,7 @@ async fn login(
             release_token,
             idle_timeout: Some(effective_timeout),
             client_metrics_enabled: state.config.server.client_metrics_enabled,
+            stream_descriptor: Some(requested_descriptor),
         })),
     )
         .into_response()
@@ -3683,12 +3801,10 @@ sentry_environment = "test"
         let url = format!("{base}/ws/agent/{session_id}?token={agent_token}");
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
-        // Build a binary frame with the FRAME_MAGIC header and a single
-        // payload byte. The server should validate the magic and relay
-        // the bytes to all video subscribers.
-        let mut frame: Vec<u8> = FRAME_MAGIC.to_le_bytes().to_vec();
-        frame.extend([0u8; 20]); // pad to satisfy the binary frame header check
-        frame.push(0x42); // arbitrary payload byte
+        // Build a complete protocol frame. The relay validates the full
+        // declared payload, not only the magic prefix, before allocation.
+        let frame = beam_protocol::VideoFrameHeader::video(640, 480, 1, 1, true)
+            .serialize_with_payload(&[0x42]);
         ws.send(WsMessage::Binary(frame.clone().into()))
             .await
             .unwrap();

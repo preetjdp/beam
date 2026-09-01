@@ -5,6 +5,38 @@
 
 import type { BeamConnection } from './connection';
 
+export interface EffectiveSizing {
+  css_width: number;
+  css_height: number;
+  encoded_width: number;
+  encoded_height: number;
+  requested_dpr: number;
+  effective_dpr_x: number;
+  effective_dpr_y: number;
+  render_scale: number;
+  limiting_reasons: string[];
+}
+
+export interface StreamDescriptor {
+  schema_version: number;
+  stream_generation: number;
+  codec: 'h264' | 'hevc';
+  profile: 'auto' | 'main' | 'high';
+  level?: string;
+  codec_string?: string;
+  encoder: string;
+  media_transport: 'websocket' | 'webtransport_datagram';
+  control_transport: string;
+  browser_pipeline: 'main_thread' | 'worker_transferred_buffers' | 'worker_owned_transport';
+  sizing: EffectiveSizing;
+  fps_target: number;
+  bitrate_kbps: number;
+  render_scale: number;
+  treatment_id: string;
+  fallback_reasons: string[];
+  frame_header_version: number;
+}
+
 /** Shape of the login API response */
 export interface LoginResponse {
   session_id: string;
@@ -12,6 +44,7 @@ export interface LoginResponse {
   release_token?: string;
   idle_timeout?: number;
   client_metrics_enabled?: boolean;
+  stream_descriptor?: StreamDescriptor;
 }
 
 /** Stored session with expiry timestamp */

@@ -15,6 +15,7 @@ import {
   lsRtt,
   lsTooltip,
   perfOverlay,
+  remoteCanvas,
   remoteVideo,
 } from './ui-state';
 
@@ -146,19 +147,35 @@ export function updatePerfOverlay(
   perfLatency: number,
   perfFps: number,
   perfBitrate: number,
-  perfLoss: number
+  perfLoss: number,
+  mode?: {
+    resolution: string;
+    codec: string;
+    encoder: string;
+    media: string;
+    control: string;
+    dpr: string;
+    fpsTarget: number;
+    bitrateTarget: number;
+    treatment: string;
+  }
 ): void {
   const rttClass = perfLatency < 20 ? 'val-good' : perfLatency < 50 ? 'val-warn' : 'val-bad';
   const fpsClass = perfFps >= 50 ? 'val-good' : perfFps >= 25 ? 'val-warn' : 'val-bad';
   const lossClass = perfLoss < 0.5 ? 'val-good' : perfLoss < 2 ? 'val-warn' : 'val-bad';
 
-  const res = `${remoteVideo.videoWidth}x${remoteVideo.videoHeight}`;
+  const res =
+    mode?.resolution ??
+    `${remoteCanvas.width || remoteVideo.videoWidth}x${remoteCanvas.height || remoteVideo.videoHeight}`;
   perfOverlay.innerHTML =
     `RTT  <span class="${rttClass}">${Math.round(perfLatency)} ms</span>\n` +
     `FPS  <span class="${fpsClass}">${Math.round(perfFps)}</span>\n` +
     `Rate <span class="val-good">${perfBitrate > 0 ? `${perfBitrate} kbps` : '--'}</span>\n` +
     `Loss <span class="${lossClass}">${perfLoss}%</span>\n` +
-    `Res  ${res}`;
+    `Res  ${res}` +
+    (mode
+      ? `\nDPR  ${mode.dpr}\nCodec ${mode.codec}\nEncoder ${mode.encoder}\nControl ${mode.control}\nMedia ${mode.media}\nTarget ${mode.fpsTarget} fps / ${mode.bitrateTarget} kbps\nProfile ${mode.treatment}`
+      : '');
 }
 
 // --- Latency stats display (status bar) ---

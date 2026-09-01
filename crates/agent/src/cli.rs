@@ -18,6 +18,13 @@ pub(crate) struct Args {
     pub encoder: Option<String>,
     pub max_width: u32,
     pub max_height: u32,
+    pub max_pixels: u64,
+    pub max_dpr: f64,
+    pub hidpi_enabled: bool,
+    pub frame_header_version: u8,
+    pub h264_profile: String,
+    pub x264_preset: String,
+    pub treatment_id: String,
     pub gpu_driver: String,
     pub display_start: u32,
 }
@@ -62,6 +69,13 @@ where
     let mut encoder: Option<String> = None;
     let mut max_width: u32 = 3840;
     let mut max_height: u32 = 2160;
+    let mut max_pixels: u64 = 8_294_400;
+    let mut max_dpr: f64 = 2.0;
+    let mut hidpi_enabled = false;
+    let mut frame_header_version: u8 = 1;
+    let mut h264_profile = "main".to_string();
+    let mut x264_preset = "veryfast".to_string();
+    let mut treatment_id = "baseline".to_string();
     let mut gpu_driver = "auto".to_string();
     let mut display_start: u32 = 10;
 
@@ -148,6 +162,43 @@ where
                     .parse()
                     .context("Invalid --max-height value")?;
             }
+            "--max-pixels" => {
+                i += 1;
+                max_pixels = args
+                    .get(i)
+                    .context("Missing --max-pixels value")?
+                    .parse()
+                    .context("Invalid --max-pixels value")?;
+            }
+            "--max-dpr" => {
+                i += 1;
+                max_dpr = args
+                    .get(i)
+                    .context("Missing --max-dpr value")?
+                    .parse()
+                    .context("Invalid --max-dpr value")?;
+            }
+            "--hidpi" => hidpi_enabled = true,
+            "--frame-header-version" => {
+                i += 1;
+                frame_header_version = args
+                    .get(i)
+                    .context("Missing --frame-header-version value")?
+                    .parse()
+                    .context("Invalid --frame-header-version value")?;
+            }
+            "--h264-profile" => {
+                i += 1;
+                h264_profile = args.get(i).context("Missing --h264-profile value")?.clone();
+            }
+            "--x264-preset" => {
+                i += 1;
+                x264_preset = args.get(i).context("Missing --x264-preset value")?.clone();
+            }
+            "--treatment-id" => {
+                i += 1;
+                treatment_id = args.get(i).context("Missing --treatment-id value")?.clone();
+            }
             "--gpu-driver" => {
                 i += 1;
                 gpu_driver = args.get(i).context("Missing --gpu-driver value")?.clone();
@@ -170,6 +221,19 @@ where
         agent_token = std::env::var("BEAM_AGENT_TOKEN").ok();
     }
 
+    if !matches!(frame_header_version, 1 | 2) {
+        anyhow::bail!("--frame-header-version must be 1 or 2");
+    }
+    if !matches!(h264_profile.as_str(), "auto" | "main" | "high") {
+        anyhow::bail!("--h264-profile must be auto, main, or high");
+    }
+    if !matches!(
+        x264_preset.as_str(),
+        "ultrafast" | "superfast" | "veryfast" | "faster"
+    ) {
+        anyhow::bail!("unsupported --x264-preset: {x264_preset}");
+    }
+
     Ok(ArgsOutcome::Run(Args {
         display,
         server_url,
@@ -183,6 +247,13 @@ where
         encoder,
         max_width,
         max_height,
+        max_pixels,
+        max_dpr,
+        hidpi_enabled,
+        frame_header_version,
+        h264_profile,
+        x264_preset,
+        treatment_id,
         gpu_driver,
         display_start,
     }))
@@ -227,10 +298,19 @@ pub(crate) fn help_text() -> String {
     s.push_str("    --width <PIXELS>             Initial display width [default: 1920]\n");
     s.push_str("    --height <PIXELS>            Initial display height [default: 1080]\n");
     s.push_str("    --framerate <FPS>            Target framerate [default: 120]\n");
-    s.push_str("    --bitrate <KBPS>             Initial video bitrate [default: 100000]\n");
+    s.push_str("    --bitrate <KBPS>             Initial video bitrate [default: 50000]\n");
     s.push_str("    --encoder <NAME>             Force encoder (nvh264enc, vah264enc, x264enc)\n");
     s.push_str("    --max-width <PIXELS>         Maximum resize width [default: 3840]\n");
     s.push_str("    --max-height <PIXELS>        Maximum resize height [default: 2160]\n");
+    s.push_str("    --max-pixels <COUNT>         Maximum encoded pixels [default: 8294400]\n");
+    s.push_str("    --max-dpr <RATIO>            Maximum device pixel ratio [default: 2.0]\n");
+    s.push_str("    --hidpi                      Enable physical-pixel sizing intents\n");
+    s.push_str("    --frame-header-version <N>   Frame header version: 1 or 2 [default: 1]\n");
+    s.push_str("    --h264-profile <PROFILE>     auto, main, high [default: main]\n");
+    s.push_str("    --x264-preset <PRESET>       ultrafast..faster [default: veryfast]\n");
+    s.push_str(
+        "    --treatment-id <ID>          Effective experiment profile [default: baseline]\n",
+    );
     s.push_str(
         "    --gpu-driver <MODE>          GPU driver: auto, nvidia, dummy [default: auto]\n",
     );
@@ -579,7 +659,7 @@ mod tests {
         assert!(h.contains("[default: 1920]"));
         assert!(h.contains("[default: 1080]"));
         assert!(h.contains("[default: 120]"));
-        assert!(h.contains("[default: 100000]"));
+        assert!(h.contains("[default: 50000]"));
         assert!(h.contains("[default: 3840]"));
         assert!(h.contains("[default: 2160]"));
         assert!(h.contains("[default: auto]"));

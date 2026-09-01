@@ -164,6 +164,8 @@ export class InputHandler {
   private firstFrameReceived = false;
   private lastSentW = 0;
   private lastSentH = 0;
+  private lastSentDpr = 0;
+  private resizeRequestGeneration = 0;
   private resizeNeededCallback: (() => void) | null = null;
 
   // Touch input state
@@ -218,6 +220,10 @@ export class InputHandler {
   private onTouchStart = this.handleTouchStart.bind(this);
   private onTouchMove = this.handleTouchMove.bind(this);
   private onTouchEnd = this.handleTouchEnd.bind(this);
+  private onWindowGeometryChange = (): void => {
+    const rect = this.target.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) this.debouncedResize(rect.width, rect.height);
+  };
   // iOS Safari fires proprietary GestureEvents for pinches and ignores
   // `maximum-scale=1` in the viewport meta — prevent them so the browser
   // never zooms the page itself regardless of touch mode (#98).
@@ -251,11 +257,7 @@ export class InputHandler {
     const rect = this.target.getBoundingClientRect();
     const w = roundToEven(rect.width);
     const h = roundToEven(rect.height);
-    this.lastSentW = w;
-    this.lastSentH = h;
-    if (w > 0 && h > 0) {
-      this.sendInput({ t: 'r', w, h });
-    }
+    if (w > 0 && h > 0) this.sendResizeIntent(w, h);
   }
 
   /**
@@ -351,6 +353,10 @@ export class InputHandler {
     this.target.addEventListener('touchend', this.onTouchEnd, { passive: false });
     this.target.addEventListener('gesturestart', this.onGesturePrevent);
     this.target.addEventListener('gesturechange', this.onGesturePrevent);
+    if (typeof window !== 'undefined') {
+      window.addEventListener('resize', this.onWindowGeometryChange);
+      window.addEventListener('focus', this.onWindowGeometryChange);
+    }
 
     // Watch for container size changes and send resize events (debounced).
     this.resizeObserver = new ResizeObserver((entries) => {
@@ -383,6 +389,10 @@ export class InputHandler {
     this.target.removeEventListener('touchend', this.onTouchEnd);
     this.target.removeEventListener('gesturestart', this.onGesturePrevent);
     this.target.removeEventListener('gesturechange', this.onGesturePrevent);
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('resize', this.onWindowGeometryChange);
+      window.removeEventListener('focus', this.onWindowGeometryChange);
+    }
     this.cancelLongPress();
     this.resetGestureState();
     this.resetZoom();
@@ -406,6 +416,8 @@ export class InputHandler {
     this.firstFrameReceived = false;
     this.lastSentW = 0;
     this.lastSentH = 0;
+    this.lastSentDpr = 0;
+    this.resizeRequestGeneration = 0;
 
     if (this.resizeObserver) {
       this.resizeObserver.disconnect();
@@ -781,10 +793,11 @@ export class InputHandler {
           clearTimeout(this.resizeTimer);
           this.resizeTimer = null;
         }
-        const significant = isSignificantResize(this.lastSentW, this.lastSentH, w, h);
-        this.lastSentW = w;
-        this.lastSentH = h;
-        this.sendInput({ t: 'r', w, h });
+        const dpr = this.currentDpr();
+        const significant =
+          isSignificantResize(this.lastSentW, this.lastSentH, w, h) ||
+          Math.abs(dpr - this.lastSentDpr) > 0.01;
+        this.sendResizeIntent(w, h);
         if (significant) {
           this.resizeNeededCallback?.();
         }
@@ -801,14 +814,37 @@ export class InputHandler {
     const eh = roundToEven(h);
     this.resizeTimer = setTimeout(() => {
       this.resizeTimer = null;
-      const significant = isSignificantResize(this.lastSentW, this.lastSentH, ew, eh);
-      this.lastSentW = ew;
-      this.lastSentH = eh;
-      this.sendInput({ t: 'r', w: ew, h: eh });
+      const dpr = this.currentDpr();
+      const significant =
+        isSignificantResize(this.lastSentW, this.lastSentH, ew, eh) ||
+        Math.abs(dpr - this.lastSentDpr) > 0.01;
+      this.sendResizeIntent(ew, eh);
       if (significant) {
         this.resizeNeededCallback?.();
       }
     }, 300);
+  }
+
+  private currentDpr(): number {
+    if (typeof window === 'undefined') return 1;
+    return Number.isFinite(window.devicePixelRatio)
+      ? Math.max(0.5, Math.min(4, window.devicePixelRatio))
+      : 1;
+  }
+
+  private sendResizeIntent(cssWidth: number, cssHeight: number): void {
+    const dpr = this.currentDpr();
+    this.lastSentW = cssWidth;
+    this.lastSentH = cssHeight;
+    this.lastSentDpr = dpr;
+    this.resizeRequestGeneration++;
+    this.sendInput({
+      t: 'ri',
+      css_w: cssWidth,
+      css_h: cssHeight,
+      dpr,
+      request_generation: this.resizeRequestGeneration,
+    });
   }
 
   // --- Touch input ---

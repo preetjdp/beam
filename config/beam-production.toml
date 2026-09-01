@@ -15,10 +15,27 @@ web_root = "/usr/share/beam/web/dist"
 # sentry_environment = "production"
 
 [video]
-bitrate = 5000      # kbps (initial target)
-min_bitrate = 500   # kbps (adaptive lower bound)
+# Measured software/WAN starting profile. Keep hardware/LAN experiments in a
+# separate treatment rather than silently applying the repository's 50 Mbps default.
+bitrate = 15000     # kbps (initial target)
+min_bitrate = 4000  # kbps (adaptive lower bound)
 max_bitrate = 20000 # kbps (adaptive upper bound)
 framerate = 60
+max_pixels = 8294400
+max_dpr = 2.0
+hidpi_enabled = false          # observe DPR intent first; enable after host benchmark
+h264_profile = "main"          # auto|main|high; High requires client negotiation
+x264_preset = "veryfast"
+frame_header_version = 1       # v2 only after client capability negotiation
+treatment_id = "software-wan"
+media_transport = "websocket"
+capture_mode = "fixed_rate"
+congestion_mode = "off"
+decode_low_watermark = 1
+decode_high_watermark = 3
+max_frame_age_ms = 150
+telemetry_sample_every = 0
+fec_group_size = 0
 # encoder = "nvh264enc"  # Auto-detected if absent: nvh264enc > vah264enc > x264enc
 
 [audio]

@@ -114,6 +114,60 @@ impl ClientMetricsStore {
         );
         metric_header(
             &mut body,
+            "beam_client_video_frames_received_total",
+            "counter",
+            "Total versioned video frames received by the browser",
+        );
+        metric_header(
+            &mut body,
+            "beam_client_video_frames_presented_total",
+            "counter",
+            "Total video frames submitted to the canvas",
+        );
+        metric_header(
+            &mut body,
+            "beam_client_sequence_gaps_total",
+            "counter",
+            "Total video sequence gaps observed by the browser",
+        );
+        metric_header(
+            &mut body,
+            "beam_client_recovery_requests_total",
+            "counter",
+            "Total dependency recovery requests from the browser",
+        );
+        metric_header(
+            &mut body,
+            "beam_client_decode_queue_size",
+            "gauge",
+            "Current WebCodecs decode queue size",
+        );
+        metric_header(
+            &mut body,
+            "beam_client_oldest_frame_age_ms",
+            "gauge",
+            "Age of the oldest pending browser frame",
+        );
+        metric_header(
+            &mut body,
+            "beam_client_presentation_submit_ms",
+            "gauge",
+            "Time to submit the latest decoded frame to canvas",
+        );
+        metric_header(
+            &mut body,
+            "beam_client_worker_event_loop_lag_ms",
+            "gauge",
+            "Media worker event-loop lag",
+        );
+        metric_header(
+            &mut body,
+            "beam_client_stream_generation",
+            "gauge",
+            "Active browser stream generation",
+        );
+        metric_header(
+            &mut body,
             "beam_client_last_report_age_seconds",
             "gauge",
             "Age of the latest browser metrics report in seconds",
@@ -182,6 +236,64 @@ impl ClientMetricsStore {
                 &labels,
                 snapshot.report.audio_buffer_delay_ms,
             );
+            push_metric(
+                &mut body,
+                "beam_client_video_frames_received_total",
+                &labels,
+                snapshot.report.video_frames_received_total,
+            );
+            push_metric(
+                &mut body,
+                "beam_client_video_frames_presented_total",
+                &labels,
+                snapshot.report.video_frames_presented_total,
+            );
+            push_metric(
+                &mut body,
+                "beam_client_sequence_gaps_total",
+                &labels,
+                snapshot.report.sequence_gaps_total,
+            );
+            push_metric(
+                &mut body,
+                "beam_client_recovery_requests_total",
+                &labels,
+                snapshot.report.recovery_requests_total,
+            );
+            if let Some(value) = snapshot.report.decode_queue_size {
+                push_metric(
+                    &mut body,
+                    "beam_client_decode_queue_size",
+                    &labels,
+                    value as u64,
+                );
+            }
+            push_optional_metric(
+                &mut body,
+                "beam_client_oldest_frame_age_ms",
+                &labels,
+                snapshot.report.oldest_frame_age_ms,
+            );
+            push_optional_metric(
+                &mut body,
+                "beam_client_presentation_submit_ms",
+                &labels,
+                snapshot.report.presentation_submit_ms,
+            );
+            push_optional_metric(
+                &mut body,
+                "beam_client_worker_event_loop_lag_ms",
+                &labels,
+                snapshot.report.worker_event_loop_lag_ms,
+            );
+            if let Some(value) = snapshot.report.stream_generation {
+                push_metric(
+                    &mut body,
+                    "beam_client_stream_generation",
+                    &labels,
+                    value as u64,
+                );
+            }
             push_f64_metric(
                 &mut body,
                 "beam_client_last_report_age_seconds",
@@ -248,6 +360,7 @@ mod tests {
                 audio_frames_decoded_total: 80,
                 audio_dropouts_total: 1,
                 audio_buffer_delay_ms: Some(25.0),
+                ..Default::default()
             },
         );
 
@@ -337,6 +450,7 @@ mod tests {
                 audio_frames_decoded_total: 9,
                 audio_dropouts_total: 10,
                 audio_buffer_delay_ms: None,
+                ..Default::default()
             },
         );
 
@@ -384,6 +498,7 @@ mod tests {
                 audio_frames_decoded_total: 0,
                 audio_dropouts_total: 0,
                 audio_buffer_delay_ms: Some(2.25),
+                ..Default::default()
             },
         );
 
