@@ -1,0 +1,37 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Architectures: amd64
+Components: main
+Date: Tue, 01 Sep 2026 01:17:33 +0000
+Suite: stable
+MD5Sum:
+ 1cbe6f9fc160611d73e214ab812bfd15               90 Release
+ 5e53cf84b3eabc19d0c9e6a1fe02748f              980 main/binary-amd64/Packages
+ 89902ed1337a077e8dffd9cf47be49ab              616 main/binary-amd64/Packages.gz
+SHA1:
+ cfa572c52c3bc4aa2ed3d65eda1f61a058941b2f               90 Release
+ ac8ec948a33f4875ad9b63e03b263abc7ee9a26b              980 main/binary-amd64/Packages
+ 58812c409933b2ebb14eba5a3d8afe256d6a53c8              616 main/binary-amd64/Packages.gz
+SHA256:
+ 9b435a1d15778bb4fcbfc2d8ce9b731262fc752c3b9278f673cda570faf8d14f               90 Release
+ e75bf0fcb4abd54b5d99d221505dc19a99897c388a4f400ec9d160de87deff3d              980 main/binary-amd64/Packages
+ 7e891f76bc43d2abeac28ab5c40b933e4b600680cf083cdfbc96193e1c2deb53              616 main/binary-amd64/Packages.gz
+SHA512:
+ cf05334d134a1a3888ff7616ca9d15aba7630f5b4d233ce5d0e43567968b5ce329a45d1945a5455dc0b23874bd9c4e6363956f370df3fb96869bfc6daeaf2cef               90 Release
+ 2a364e5993cf16f68c313da5aa3d1df7878f031f94b85c98b47f8b430ab56701bc150b8756ff84a53da9d819d4634018060517babaa9fc5b933986734fc08503              980 main/binary-amd64/Packages
+ b187c8b46011d270103c06b8d9d521e8315c42fad53e7227623b93d6e9bf0156913039b63f4497669c36e28166e4161d3a2b210a654f70b86c2a3e1aad0b7fe6              616 main/binary-amd64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+iQHPBAEBCAA5FiEEVRcoWYxFqKFa/muiGDZ3G0w6+5kFAmqWJ60bFIAAAAAABAAO
+bWFudTIsMi41KzEuMTIsMCwzAAoJEBg2dxtMOvuZ0kIL/0BAzs3HU5Papz2ZMw27
+F5D0L4NtmOORsjKgqpvkGObejFQ1t0H2hsK9UGeohaT9PUgKEOUjZQi71F1o3YHZ
+4HHPcOsV/Ud7lLHaIeQm6o1M49vzjVwKkzF7ElZUbLmDlUebJ4x7IfvlEcUpoq7c
+EtEY6Yok9iK82ESJQA4gReULdDbeAvvTzd2Xh8kejQ9U8iXSxHJWlZVdlafm8Kcu
+LmdHaZLMFzgV47sCE5cwGQyG8BiNACk7/Xc4nivZEPz8rEZSUv+3vz0ikTOwhivI
+X7LxWnGQHnOWnF6CNY4/ktZkZt+wmJZ62o45JSim+m6j5F1cCjFzCShGAlY8bp7+
+aS1yHZJRbmFegoS0xlnfGXp5cThTU5GH0bu4PuT6YdK0b1qPYq9I6ebxbFIvZSwU
+5eg8zcp0DEhWQM0fPknIUTOMVVmmsgaXoAOancL4jdpJG6o1mFhZhalN4HDL4UdJ
+nOycAewD2KFVf5yjVwNFfyU5jzJQvQDf0oazQCx7Z2tiMA==
+=Ly8N
+-----END PGP SIGNATURE-----
