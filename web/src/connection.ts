@@ -224,6 +224,7 @@ export class BeamConnection {
   private lastVideoSequence: bigint | null = null;
   private awaitingRecovery = false;
   private recoveryRequestsTotal = 0;
+  private lastRecoveryRequestMs = Number.NEGATIVE_INFINITY;
   private sequenceGapsTotal = 0;
   private streamDescriptor: StreamDescriptor | null = null;
   private webTransportReceiver: WebTransportMediaReceiver | null = null;
@@ -420,8 +421,8 @@ export class BeamConnection {
     const { header, payload } = result;
     const isAudio = (header.flags & 0x02) !== 0;
 
-    if (!isAudio && source === 'wss' && this.webTransportActive) {
-      return; // Video moved to datagrams; audio remains on reliable WSS.
+    if (!isAudio && source === 'wss' && this.webTransportActive && (header.flags & 0x01) === 0) {
+      return; // Datagram deltas; reliable WSS still carries recovery keyframes.
     }
 
     if (isAudio) {
@@ -442,9 +443,13 @@ export class BeamConnection {
 
   private admitVideoHeader(header: FrameHeader): boolean {
     const ext = header.extension;
-    if (!ext) return true; // negotiated compatibility stream
+    const wireKeyframe = (header.flags & 0x01) !== 0;
+    if (!ext) {
+      if (wireKeyframe) this.awaitingRecovery = false;
+      return !this.awaitingRecovery || wireKeyframe;
+    }
 
-    const isKey = ext.dependency === 'key' || (header.flags & 0x01) !== 0;
+    const isKey = ext.dependency === 'key' || wireKeyframe;
     if (this.activeGeneration === null || ext.streamGeneration > this.activeGeneration) {
       this.activeGeneration = ext.streamGeneration;
       this.lastVideoSequence = null;
@@ -485,6 +490,10 @@ export class BeamConnection {
 
   private requestRecovery(generation: number, reason: string): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
+    const now = performance.now();
+    if (now - this.lastRecoveryRequestMs < 250) return;
+    this.lastRecoveryRequestMs = now;
+    this.awaitingRecovery = true;
     this.recoveryRequestsTotal++;
     this.ws.send(JSON.stringify({ t: 'rk', generation, reason }));
   }

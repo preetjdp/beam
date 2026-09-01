@@ -112,6 +112,7 @@ async fn handle_incoming(incoming: IncomingSession, state: Arc<AppState>) -> Res
     let connection_id = u32::from_le_bytes(session_id.as_bytes()[..4].try_into().unwrap());
     let mut sequence = 0u64;
     let generation = 1u32;
+    let mut last_recovery_request = std::time::Instant::now() - Duration::from_secs(1);
     let max_datagram = connection
         .max_datagram_size()
         .unwrap_or(MAX_DATAGRAM_PAYLOAD)
@@ -128,10 +129,13 @@ async fn handle_incoming(incoming: IncomingSession, state: Arc<AppState>) -> Res
                     Ok(bytes) => bytes,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(%session_id, skipped, "WebTransport relay lagged; requesting recovery");
-                        let _ = channel.to_agent.send(AgentCommand::Input(InputEvent::RequestKeyframe {
-                            generation,
-                            reason: "webtransport_server_lag".to_string(),
-                        }));
+                        if last_recovery_request.elapsed() >= Duration::from_millis(250) {
+                            last_recovery_request = std::time::Instant::now();
+                            let _ = channel.to_agent.send(AgentCommand::Input(InputEvent::RequestKeyframe {
+                                generation,
+                                reason: "webtransport_server_lag".to_string(),
+                            }));
+                        }
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -175,7 +179,11 @@ async fn handle_incoming(incoming: IncomingSession, state: Arc<AppState>) -> Res
                         break;
                     }
                 }
-                if failed && dependency != DependencyClass::Disposable {
+                if failed
+                    && dependency != DependencyClass::Disposable
+                    && last_recovery_request.elapsed() >= Duration::from_millis(250)
+                {
+                    last_recovery_request = std::time::Instant::now();
                     let _ = channel.to_agent.send(AgentCommand::Input(InputEvent::RequestKeyframe {
                         generation,
                         reason: "webtransport_send_drop".to_string(),

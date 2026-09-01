@@ -81,6 +81,7 @@ export class WebTransportMediaReceiver {
   private reassemblyBytes = 0;
   private latestGeneration = 0;
   private lastCompletedSequence: bigint | null = null;
+  private gapReportedAtSequence: bigint | null = null;
   private stopped = false;
 
   constructor(
@@ -154,12 +155,15 @@ export class WebTransportMediaReceiver {
       this.reassemblyBytes = 0;
       this.latestGeneration = header.generation;
       this.lastCompletedSequence = null;
+      this.gapReportedAtSequence = null;
     }
     if (
       this.lastCompletedSequence !== null &&
       header.sequence > this.lastCompletedSequence + 1n &&
-      header.dependency !== 'disposable'
+      header.dependency !== 'disposable' &&
+      this.gapReportedAtSequence !== header.sequence
     ) {
+      this.gapReportedAtSequence = header.sequence;
       this.onRecovery(header.generation, 'webtransport_sequence_gap');
     }
 
@@ -211,6 +215,7 @@ export class WebTransportMediaReceiver {
     this.dropPartial(key, partial, false);
     if (offset !== complete.byteLength) return;
     this.lastCompletedSequence = header.sequence;
+    if (header.dependency === 'key') this.gapReportedAtSequence = null;
     this.onFrame(complete.buffer);
   }
 

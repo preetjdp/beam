@@ -297,8 +297,12 @@ pub async fn handle_browser_ws(
                 match result {
                     Ok(frame) => {
                         if webtransport_media_active
-                            && VideoFrameHeader::deserialize(&frame).is_ok_and(|header| !header.is_audio())
+                            && VideoFrameHeader::deserialize(&frame)
+                                .is_ok_and(|header| !header.is_audio() && !header.is_keyframe())
                         {
+                            // Delta video uses datagrams. Recovery keyframes remain
+                            // duplicated on reliable WSS so one lost keyframe fragment
+                            // cannot trap the decoder in a recovery storm.
                             continue;
                         }
                         video_frames_relayed += 1;
