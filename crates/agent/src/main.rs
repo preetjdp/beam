@@ -686,7 +686,9 @@ pub(crate) fn classify_input_event(
             generation: *generation,
             reason: reason.chars().take(64).collect(),
         },
-        InputEvent::ClockSync { .. } => InputAction::Ignore,
+        InputEvent::ClockSync { .. } | InputEvent::MediaTransportState { .. } => {
+            InputAction::Ignore
+        }
         InputEvent::Layout { layout } => {
             if is_valid_layout_name(layout) {
                 InputAction::Layout {

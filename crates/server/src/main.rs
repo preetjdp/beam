@@ -6,6 +6,7 @@ mod session;
 mod signaling;
 mod tls;
 mod web;
+mod webtransport;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -529,6 +530,12 @@ async fn main() -> Result<()> {
         config.server.tls_cert.as_deref(),
         config.server.tls_key.as_deref(),
     )?;
+    let webtransport_endpoint =
+        if config.video.media_transport == beam_protocol::MediaTransport::WebtransportDatagram {
+            Some(webtransport::build_server(port, tls_result.config.clone())?)
+        } else {
+            None
+        };
     let tls_acceptor = tls::make_acceptor(tls_result.config);
     let tls_cert_path = tls_result.cert_pem_path;
 
@@ -582,6 +589,10 @@ async fn main() -> Result<()> {
         metrics_agent_restarts: std::sync::atomic::AtomicU64::new(0),
         client_metrics: Arc::new(client_metrics::ClientMetricsStore::default()),
     });
+
+    if let Some(endpoint) = webtransport_endpoint {
+        tokio::spawn(webtransport::run(endpoint, Arc::clone(&state)));
+    }
 
     // Restore sessions from previous graceful shutdown
     let restored = state.session_manager.restore_sessions().await;

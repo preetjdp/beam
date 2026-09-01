@@ -18,6 +18,7 @@
  */
 
 import type { StreamDescriptor } from './session';
+import { WebTransportMediaReceiver } from './webtransport-media';
 
 export const FRAME_HEADER_SIZE = 24;
 export const FRAME_V2_HEADER_SIZE = 48;
@@ -122,6 +123,7 @@ export type InputEvent =
   | { t: 'ri'; css_w: number; css_h: number; dpr: number; request_generation: number }
   | { t: 'rk'; generation: number; reason: string }
   | { t: 'cs'; id: number; t0_us: number }
+  | { t: 'mt'; webtransport_active: boolean }
   | { t: 'l'; layout: string }
   | { t: 'q'; mode: string }
   | { t: 'vs'; visible: boolean }
@@ -224,6 +226,8 @@ export class BeamConnection {
   private recoveryRequestsTotal = 0;
   private sequenceGapsTotal = 0;
   private streamDescriptor: StreamDescriptor | null = null;
+  private webTransportReceiver: WebTransportMediaReceiver | null = null;
+  private webTransportActive = false;
 
   // Callbacks
   private videoFrameCallback: VideoFrameCallback | null = null;
@@ -364,12 +368,13 @@ export class BeamConnection {
       wsOpened = true;
       this.reconnectAttempt = 0;
       this.sendMetricsPing();
+      void this.startWebTransportIfNegotiated();
       this.connectedCallback?.();
     };
 
     this.ws.onmessage = (event: MessageEvent) => {
       if (event.data instanceof ArrayBuffer) {
-        this.handleBinaryMessage(event.data);
+        this.handleBinaryMessage(event.data, 'wss');
       } else if (typeof event.data === 'string') {
         this.handleTextMessage(event.data);
       }
@@ -399,8 +404,8 @@ export class BeamConnection {
 
   private binaryMessageCount = 0;
 
-  /** Parse a 24-byte binary frame header and dispatch to video/audio callback */
-  private handleBinaryMessage(data: ArrayBuffer): void {
+  /** Parse a binary frame and dispatch to video/audio callback. */
+  private handleBinaryMessage(data: ArrayBuffer, source: 'wss' | 'webtransport'): void {
     this.binaryMessageCount++;
     if (this.binaryMessageCount <= 3) {
       console.log(`[Beam] Binary message #${this.binaryMessageCount}: ${data.byteLength} bytes`);
@@ -414,6 +419,10 @@ export class BeamConnection {
 
     const { header, payload } = result;
     const isAudio = (header.flags & 0x02) !== 0;
+
+    if (!isAudio && source === 'wss' && this.webTransportActive) {
+      return; // Video moved to datagrams; audio remains on reliable WSS.
+    }
 
     if (isAudio) {
       this.audioBytesThisSecond += data.byteLength;
@@ -478,6 +487,49 @@ export class BeamConnection {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
     this.recoveryRequestsTotal++;
     this.ws.send(JSON.stringify({ t: 'rk', generation, reason }));
+  }
+
+  private async startWebTransportIfNegotiated(): Promise<void> {
+    if (
+      this.streamDescriptor?.media_transport !== 'webtransport_datagram' ||
+      !WebTransportMediaReceiver.supported() ||
+      this.webTransportReceiver
+    ) {
+      return;
+    }
+    const receiver = new WebTransportMediaReceiver(
+      this.sessionId,
+      this.token,
+      (frame) => this.handleBinaryMessage(frame, 'webtransport'),
+      (generation, reason) => this.requestRecovery(generation, reason),
+      (reason) => this.fallbackFromWebTransport(reason)
+    );
+    this.webTransportReceiver = receiver;
+    try {
+      await receiver.connect();
+      if (this.webTransportReceiver !== receiver) return;
+      this.webTransportActive = true;
+      this.sendInput({ t: 'mt', webtransport_active: true });
+      this.requestRecovery(this.activeGeneration ?? 0, 'webtransport_client_ready');
+    } catch {
+      if (this.webTransportReceiver === receiver) this.fallbackFromWebTransport('setup_failed');
+    }
+  }
+
+  private fallbackFromWebTransport(reason: string): void {
+    this.webTransportActive = false;
+    this.sendInput({ t: 'mt', webtransport_active: false });
+    this.webTransportReceiver?.close();
+    this.webTransportReceiver = null;
+    if (this.streamDescriptor?.media_transport === 'webtransport_datagram') {
+      this.streamDescriptor = {
+        ...this.streamDescriptor,
+        media_transport: 'websocket',
+        fallback_reasons: [...this.streamDescriptor.fallback_reasons, `webtransport_${reason}`],
+      };
+      this.streamDescriptorCallback?.(this.streamDescriptor);
+    }
+    this.requestRecovery(this.activeGeneration ?? 0, `webtransport_${reason}`);
   }
 
   /** Handle incoming JSON text messages (signaling + agent messages) */
@@ -665,6 +717,10 @@ export class BeamConnection {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+
+    this.webTransportActive = false;
+    this.webTransportReceiver?.close();
+    this.webTransportReceiver = null;
 
     if (this.ws) {
       this.ws.close();

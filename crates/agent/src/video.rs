@@ -114,6 +114,7 @@ pub(crate) async fn run_video_send_loop(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)] // explicit shared recovery/identity state at the async boundary
 pub(crate) async fn run_video_send_loop_extended(
     encoded_rx: &mut mpsc::Receiver<Vec<u8>>,
     ws_tx: &WsSender,

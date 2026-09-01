@@ -3,7 +3,7 @@ members = ["crates/server", "crates/agent", "crates/protocol"]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.26+wan.1"
+version = "0.3.26+wan.2"
 edition = "2024"
 license = "MIT"
 authors = ["Beam Contributors"]
@@ -51,6 +51,7 @@ tokio-rustls = "0.26.4"
 
 # HTTP internals
 hyper-util = { version = "0.1.20", features = ["tokio", "server-auto"] }
+wtransport = "0.7.2"
 
 # Auth
 jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }

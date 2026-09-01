@@ -160,7 +160,7 @@ sudo systemctl restart beam
 
 ### Network
 
-The compatibility deployment needs only **port 8444/tcp** (HTTPS + WSS). H.264 Main over WSS remains available to every client. Experimental WebTransport profiles additionally require UDP on the same numeric HTTPS port; do not advertise HTTP/3 until that listener is configured and healthy.
+The compatibility deployment needs only **port 8444/tcp** (HTTPS + WSS). H.264 Main over WSS remains available to every client. Setting `video.media_transport = "webtransport_datagram"` also binds HTTP/3 WebTransport on UDP at the same numeric port: video moves to bounded QUIC datagrams after the browser confirms readiness, while control, audio, and automatic fallback remain on WSS. Open both TCP and UDP for that profile.
 
 - Beam binds to `0.0.0.0` by default — restrict with `bind = "10.0.0.1"` in `beam.toml` if needed
 

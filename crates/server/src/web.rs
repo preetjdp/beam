@@ -401,9 +401,16 @@ fn initial_stream_descriptor(req: &AuthRequest, config: &BeamConfig) -> StreamDe
             }
             1
         };
-    if config.video.media_transport != MediaTransport::Websocket {
-        fallback_reasons.push("enhanced_media_transport_not_active".to_string());
-    }
+    let media_transport = match config.video.media_transport {
+        MediaTransport::WebtransportDatagram if capabilities.webtransport_datagrams => {
+            MediaTransport::WebtransportDatagram
+        }
+        MediaTransport::WebtransportDatagram => {
+            fallback_reasons.push("client_webtransport_datagrams_unsupported".to_string());
+            MediaTransport::Websocket
+        }
+        MediaTransport::Websocket => MediaTransport::Websocket,
+    };
 
     StreamDescriptor {
         stream_generation: 1,
@@ -414,7 +421,7 @@ fn initial_stream_descriptor(req: &AuthRequest, config: &BeamConfig) -> StreamDe
             .encoder
             .clone()
             .unwrap_or_else(|| "auto".to_string()),
-        media_transport: MediaTransport::Websocket,
+        media_transport,
         sizing,
         fps_target: config.video.framerate,
         bitrate_kbps: config.video.bitrate,

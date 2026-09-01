@@ -86,6 +86,8 @@ pub(crate) enum BrowserMessageOutcome {
     Metrics(beam_protocol::ClientMetricsReport),
     /// Four-timestamp clock synchronization request.
     ClockSync { id: u32, t0_us: u64 },
+    /// Switch reliable WSS video relay off/on after WebTransport readiness.
+    MediaTransportState { webtransport_active: bool },
     /// A regular input event — wrap as AgentCommand and forward to the agent.
     Forward(AgentCommand),
     /// Malformed JSON or unknown shape — reply with an error frame whose body
@@ -128,6 +130,11 @@ pub(crate) fn parse_browser_text(text: &str) -> BrowserMessageOutcome {
         }
         Ok(InputEvent::ClientMetrics(report)) => BrowserMessageOutcome::Metrics(report),
         Ok(InputEvent::ClockSync { id, t0_us }) => BrowserMessageOutcome::ClockSync { id, t0_us },
+        Ok(InputEvent::MediaTransportState {
+            webtransport_active,
+        }) => BrowserMessageOutcome::MediaTransportState {
+            webtransport_active,
+        },
         Ok(event) => BrowserMessageOutcome::Forward(AgentCommand::Input(event)),
         Err(e) => BrowserMessageOutcome::InvalidJson(e.to_string()),
     }
@@ -240,6 +247,7 @@ pub async fn handle_browser_ws(
 
     tracing::info!(%session_id, "Browser WebSocket connected");
     let mut video_frames_relayed: u64 = 0;
+    let mut webtransport_media_active = false;
 
     loop {
         tokio::select! {
@@ -288,6 +296,11 @@ pub async fn handle_browser_ws(
             result = from_agent_video.recv() => {
                 match result {
                     Ok(frame) => {
+                        if webtransport_media_active
+                            && VideoFrameHeader::deserialize(&frame).is_ok_and(|header| !header.is_audio())
+                        {
+                            continue;
+                        }
                         video_frames_relayed += 1;
                         if should_log_initial_video_frame(video_frames_relayed) {
                             tracing::info!(%session_id, size = frame.len(), frame = video_frames_relayed, "Relaying binary frame to browser");
@@ -339,6 +352,10 @@ pub async fn handle_browser_ws(
                                 if let Ok(json) = serde_json::to_string(&msg) {
                                     let _ = socket.send(Message::Text(json.into())).await;
                                 }
+                            }
+                            BrowserMessageOutcome::MediaTransportState { webtransport_active } => {
+                                webtransport_media_active = webtransport_active;
+                                tracing::info!(%session_id, webtransport_media_active, "Browser media relay path changed");
                             }
                             BrowserMessageOutcome::Forward(cmd) => {
                                 if let Err(e) = channel.to_agent.send(cmd) {
@@ -878,6 +895,18 @@ mod tests {
                 assert_eq!(h, 1440);
             }
             other => panic!("Expected Forward Resize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_browser_text_media_transport_state_is_consumed_by_relay() {
+        match parse_browser_text(r#"{"t":"mt","webtransport_active":true}"#) {
+            BrowserMessageOutcome::MediaTransportState {
+                webtransport_active,
+            } => {
+                assert!(webtransport_active);
+            }
+            other => panic!("Expected MediaTransportState, got {other:?}"),
         }
     }
 

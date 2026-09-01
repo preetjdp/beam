@@ -6,6 +6,7 @@ use crate::{ClientCapabilities, StreamDescriptor};
 /// Signaling messages between browser, server, and agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // wire enum keeps serde payloads direct and backwards-compatible
 pub enum SignalingMessage {
     /// Session created successfully
     SessionReady { session_id: Uuid },
@@ -126,6 +127,9 @@ pub enum InputEvent {
     /// NTP-style browser/server clock probe.
     #[serde(rename = "cs")]
     ClockSync { id: u32, t0_us: u64 },
+    /// Browser media-path readiness; consumed by the relay, not the agent.
+    #[serde(rename = "mt")]
+    MediaTransportState { webtransport_active: bool },
     /// Keyboard layout hint (XKB layout name, e.g. "no", "us", "de")
     #[serde(rename = "l")]
     Layout { layout: String },
@@ -228,6 +232,7 @@ pub struct SessionInfo {
 /// Uses adjacently tagged representation to avoid tag collision with nested types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", content = "data", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // boxing would alter broad command construction APIs for no wire benefit
 pub enum AgentCommand {
     /// Forward an input event to the agent
     Input(InputEvent),

@@ -27,6 +27,7 @@ rustls = { workspace = true }
 rcgen = { workspace = true }
 tokio-rustls = { workspace = true }
 hyper-util = { workspace = true }
+wtransport = { workspace = true }
 jsonwebtoken = { workspace = true }
 pam-client2 = { workspace = true }
 nix = { workspace = true }
@@ -34,6 +35,7 @@ bytes = "1"
 pem = "4"
 sentry = { workspace = true }
 regex = { workspace = true }
+urlencoding = "2"
 
 [dev-dependencies]
 http-body-util = "0.1"

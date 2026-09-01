@@ -36,6 +36,7 @@ pub(crate) struct Args {
 /// but the underlying parse logic in `parse_args_from` is side-effect-free
 /// (no `std::process::exit`, no `println!`).
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // parser outcome is startup-only; boxing complicates every test/call site
 pub(crate) enum ArgsOutcome {
     /// Continue startup with these settings.
     Run(Args),
