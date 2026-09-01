@@ -1,7 +1,7 @@
 {
   "name": "beam-web",
   "private": true,
-  "version": "0.3.26",
+  "version": "0.3.26+wan.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
